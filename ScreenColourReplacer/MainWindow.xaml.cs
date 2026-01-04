@@ -521,15 +521,17 @@ namespace ScreenColourReplacer
             {
                 if (!IsWindowVisible(h) || IsIconic(h)) continue;
                 if (h == _overlayHwnd) continue;
-                if (IsIgnoredOccluderWindow(h)) continue;
 
                 if (!GetWindowRect(h, out var wr)) continue;
-                if (!Intersect(wr, interest, out _)) continue; // <<< huge prune
+                if (!Intersect(wr, interest, out _)) continue; // <<< prune FIRST
+
+                if (IsIgnoredOccluderWindow(h)) continue;      // <<< expensive check LAST
 
                 _zIndex[h] = _zOrder.Count;
                 _zOrder.Add((h, wr));
             }
         }
+
 
 
         private List<RECT> GetVisibleExcelRects_FromZ(
@@ -1067,13 +1069,17 @@ namespace ScreenColourReplacer
                 if (!GetClientRect(hWnd, out var rcClient)) return true;
                 if (rcClient.Width <= 0 || rcClient.Height <= 0) return true;
 
-                var tl = new POINT { X = rcClient.Left, Y = rcClient.Top };
-                var br = new POINT { X = rcClient.Right, Y = rcClient.Bottom };
+                // Client origin (0,0) -> screen
+                var tl = new POINT { X = 0, Y = 0 };
                 ClientToScreen(hWnd, ref tl);
-                ClientToScreen(hWnd, ref br);
 
-                _wins.Add(new ExcelWin(hWnd, new RECT { Left = tl.X, Top = tl.Y, Right = br.X, Bottom = br.Y }));
+                // BR = TL + client size (no second ClientToScreen)
+                int right = tl.X + rcClient.Right;   // rcClient.Right == width
+                int bottom = tl.Y + rcClient.Bottom; // rcClient.Bottom == height
+
+                _wins.Add(new ExcelWin(hWnd, new RECT { Left = tl.X, Top = tl.Y, Right = right, Bottom = bottom }));
                 return true;
+
             }, IntPtr.Zero);
 
             return _wins;
