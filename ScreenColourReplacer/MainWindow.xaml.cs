@@ -59,6 +59,7 @@ namespace ScreenColourReplacer
         public MainWindow()
         {
             InitializeComponent();
+            LoadHueFromConfig();
             BuildLut();
             _timer.Tick += (_, __) => Tick();
         }
@@ -486,7 +487,7 @@ namespace ScreenColourReplacer
 
                         if (match)
                         {
-                            HsvToRgb(PURPLE_HUE_DEG, s, v, out byte rr, out byte gg, out byte bb);
+                            HsvToRgb(_targetHueDeg, s, v, out byte rr, out byte gg, out byte bb);
 
                             // WriteableBitmap is BGRA in memory.
                             // Pack as 0xAARRGGBB so little-endian bytes are BB GG RR AA.
@@ -503,7 +504,13 @@ namespace ScreenColourReplacer
         }
 
         // ---------- Hue matching config (your targets) ----------
-        private const float PURPLE_HUE_DEG = 285f;
+        private const int DEFAULT_TARGET_HUE_DEG = 285;
+        private int _targetHueDeg = DEFAULT_TARGET_HUE_DEG;
+
+        private static readonly string HueConfigPath =
+            Path.Combine(AppContext.BaseDirectory, "ScreenColourReplacer.config");
+
+
         private const float MIN_V = 0.08f;
 
         // (HueDeg, TolDeg, MinS)
@@ -546,6 +553,45 @@ namespace ScreenColourReplacer
                 h ^= (ulong)(uint)r.Bottom; h *= PRIME;
             }
             return h;
+        }
+
+        private void LoadHueFromConfig()
+        {
+            _targetHueDeg = DEFAULT_TARGET_HUE_DEG;
+
+            try
+            {
+                if (!File.Exists(HueConfigPath))
+                    return;
+
+                foreach (var raw in File.ReadAllLines(HueConfigPath))
+                {
+                    var line = raw.Trim();
+                    if (line.Length == 0) continue;
+                    if (line.StartsWith("//") || line.StartsWith(";")) continue;
+
+                    const string key = "HUE=";
+                    if (!line.StartsWith(key, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var value = line.Substring(key.Length).Trim();
+
+                    if (int.TryParse(value, out int hue))
+                    {
+                        // clamp into [0, 359] but also allow negative or 360+ by wrapping
+                        hue %= 360;
+                        if (hue < 0) hue += 360;
+
+                        _targetHueDeg = hue;
+                    }
+
+                    return; // only one HUE line expected
+                }
+            }
+            catch
+            {
+                _targetHueDeg = DEFAULT_TARGET_HUE_DEG;
+            }
         }
 
 
