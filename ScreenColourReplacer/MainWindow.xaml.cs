@@ -30,7 +30,7 @@ namespace ScreenColourReplacer
     public partial class MainWindow : Window
     {
         // ---------- Perf knobs ----------
-        private const int TIMER_MS = 6; // 20 FPS-ish. Try 33 for 30 FPS, 100 for 10 FPS.
+        private const int TIMER_MS = 20; // 20 FPS-ish. Try 33 for 30 FPS, 100 for 10 FPS.
         private const int LUT_BITS = 5;  // 5 => 32 levels/channel (32^3 = 32768)
         private const int LUT_SIZE = 1 << LUT_BITS;
         private const int LUT_MASK = LUT_SIZE - 1;
