@@ -454,11 +454,8 @@ namespace ScreenColourReplacer
                         string exe = Path.GetFileName(sb.ToString());
 
                         // Snipping Tool / clipping overlay (most common)
-                        if (exe.Equals("ScreenClippingHost.exe", StringComparison.OrdinalIgnoreCase) ||
-                            exe.Equals("SnippingTool.exe", StringComparison.OrdinalIgnoreCase))
-                        {
+                        if (EndsWithExe(sb, "ScreenClippingHost.exe") || EndsWithExe(sb, "SnippingTool.exe"))
                             ignored = true;
-                        }
                     }
                 }
                 finally
@@ -841,25 +838,43 @@ namespace ScreenColourReplacer
 
         private void RemoveOtherSizesForHwnd(IntPtr hwnd, int keepW, int keepH)
         {
-            List<CacheKey>? kill = null;
+            _toDeleteKeys.Clear();
 
             foreach (var kv in _cache)
-            {
                 if (kv.Key.Hwnd == hwnd && (kv.Key.W != keepW || kv.Key.H != keepH))
-                {
-                    kill ??= new List<CacheKey>();
-                    kill.Add(kv.Key);
-                }
-            }
+                    _toDeleteKeys.Add(kv.Key);
 
-            if (kill == null) return;
-
-            foreach (var k in kill)
+            for (int i = 0; i < _toDeleteKeys.Count; i++)
             {
+                var k = _toDeleteKeys[i];
                 _cache[k].Dispose();
                 _cache.Remove(k);
             }
         }
+
+        static bool EndsWithExe(StringBuilder sb, string exe)
+        {
+            // compare trailing filename case-insensitive
+            int len = sb.Length;
+            int slash = -1;
+            for (int i = len - 1; i >= 0; i--)
+            {
+                char c = sb[i];
+                if (c == '\\' || c == '/') { slash = i; break; }
+            }
+            int start = slash + 1;
+            int fnLen = len - start;
+            if (fnLen != exe.Length) return false;
+
+            for (int i = 0; i < fnLen; i++)
+            {
+                char a = char.ToLowerInvariant(sb[start + i]);
+                char b = char.ToLowerInvariant(exe[i]);
+                if (a != b) return false;
+            }
+            return true;
+        }
+
 
 
         // ---------- High-performance capture cache (BitBlt -> DIB section) ----------
