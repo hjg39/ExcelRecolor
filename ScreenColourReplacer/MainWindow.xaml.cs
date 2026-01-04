@@ -1,14 +1,15 @@
-﻿using System.Runtime.InteropServices;
+﻿using System.Buffers.Binary;
+using System.IO;
+using System.IO.Hashing;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows;
 using System.Windows.Interop;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
-using System.Buffers.Binary;
-using System.IO.Hashing;
-using System.Runtime.CompilerServices;
-using System.IO;
-using System.Windows.Media;
 
 
 
@@ -98,15 +99,19 @@ namespace ScreenColourReplacer
         }
 
 
-        private unsafe ulong ComputeSignatureFull(IntPtr bits, int stride, int w, int h)
+        private unsafe ulong ComputeSignatureSampled(IntPtr bits, int stride, int w, int h)
         {
             int rowBytes = w * 4;
-            byte* p = (byte*)bits.ToPointer();
+            int sampleRows = 12;                 // tune
+            int bytesPerRow = Math.Min(rowBytes, 16 * 1024); // tune
 
+            byte* p = (byte*)bits.ToPointer();
             var hasher = new XxHash3();
-            for (int y = 0; y < h; y++)
+
+            for (int i = 0; i < sampleRows; i++)
             {
-                var row = new ReadOnlySpan<byte>(p + y * stride, rowBytes);
+                int y = (int)((long)i * (h - 1) / (sampleRows - 1));
+                var row = new ReadOnlySpan<byte>(p + y * stride, bytesPerRow);
                 hasher.Append(row);
             }
 
@@ -114,6 +119,7 @@ namespace ScreenColourReplacer
             hasher.GetCurrentHash(out8);
             return BinaryPrimitives.ReadUInt64LittleEndian(out8);
         }
+
 
 
         // ---- Click-through / no-activate / don't-capture-self ----
@@ -193,21 +199,39 @@ namespace ScreenColourReplacer
                                 visibles.Add(cap);
                         }
 
-                        // Visibility signature (changes when Excel goes behind something / uncovered)
                         ulong visSig = ComputeRectsSignature(visibles);
+                        bool visChanged = !cc.HasLastVisSig || visSig != cc.LastVisSig;
 
-                        // Capture ONCE for the whole Excel client
+                        // ✅ Capture the latest pixels NOW (needed for hashing + drawing)
                         cc.CaptureExcelClientOrFallback(w.Hwnd, screenDc, w.Rect.Left, w.Rect.Top);
 
-                        // Pixel signature (content changes)
-                        ulong sig = ComputeSignatureFull(cc.BitsPtr, cc.SrcStride, fullW, fullH);
+                        bool contentChanged;
+                        ulong sig = 0;
 
-                        // Decide if we must update: content OR visibility changed
-                        bool contentChanged = !cc.HasLastSig || sig != cc.LastSig;
-                        bool visChanged = !cc.HasLastVisSig || visSig != cc.LastVisSig;
+                        if (visChanged)
+                        {
+                            // we're going to redraw anyway
+                            contentChanged = true;
+
+                            // (optional but recommended) refresh sig so when vis stabilizes you don’t redraw twice
+                            sig = ComputeSignatureSampled(cc.BitsPtr, cc.SrcStride, fullW, fullH);
+                            cc.LastSig = sig;
+                            cc.HasLastSig = true;
+                        }
+                        else
+                        {
+                            sig = ComputeSignatureSampled(cc.BitsPtr, cc.SrcStride, fullW, fullH);
+                            contentChanged = !cc.HasLastSig || sig != cc.LastSig;
+                            if (contentChanged)
+                            {
+                                cc.LastSig = sig;
+                                cc.HasLastSig = true;
+                            }
+                        }
 
                         if (!contentChanged && !visChanged)
                             continue;
+
 
                         // ---- IMPORTANT: clear what we drew last time for this hwnd ----
                         foreach (var old in cc.LastVisibleRects)
@@ -221,8 +245,6 @@ namespace ScreenColourReplacer
                         }
 
                         // Update stored signatures + rects
-                        cc.LastSig = sig;
-                        cc.HasLastSig = true;
 
                         cc.LastVisSig = visSig;
                         cc.HasLastVisSig = true;
