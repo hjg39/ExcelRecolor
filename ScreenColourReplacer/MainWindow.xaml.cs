@@ -30,7 +30,7 @@ namespace ScreenColourReplacer
     public partial class MainWindow : Window
     {
         // ---------- Perf knobs ----------
-        private const int TIMER_MS = 20; // 20 FPS-ish. Try 33 for 30 FPS, 100 for 10 FPS.
+        private const int TIMER_MS = 30; // 20 FPS-ish. Try 33 for 30 FPS, 100 for 10 FPS.
         private const int LUT_BITS = 5;  // 5 => 32 levels/channel (32^3 = 32768)
         private const int LUT_SIZE = 1 << LUT_BITS;
         private const int LUT_MASK = LUT_SIZE - 1;
@@ -127,7 +127,7 @@ namespace ScreenColourReplacer
             SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle);
 
             // Prevent overlay being included in the capture (stops feedback flicker)
-            //SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+            SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
         }
 
         private void Tick()
@@ -443,33 +443,45 @@ namespace ScreenColourReplacer
             for (int y = 0; y < h; y++)
             {
                 byte* sRow = srcBase + (srcY + y) * srcStride + srcX * 4;
-
-                byte* dRowBytes = dstBase + (dstY + y) * dstStride + dstX * 4;
-                uint* dRow = (uint*)dRowBytes;
+                uint* dRow = (uint*)(dstBase + (dstY + y) * dstStride + dstX * 4);
 
                 for (int x = 0; x < w; x++)
                 {
                     int si = x * 4;
-                    byte b = sRow[si + 0];
-                    byte g = sRow[si + 1];
-                    byte r = sRow[si + 2];
+
+                    // Read source as a packed pixel (BGRA in memory)
+                    uint src = *(uint*)(sRow + si) | 0xFF000000u;
+
+                    byte b = (byte)(src & 0xFF);
+                    byte g = (byte)((src >> 8) & 0xFF);
+                    byte r = (byte)((src >> 16) & 0xFF);
 
                     int rQ = r >> (8 - LUT_BITS);
                     int gQ = g >> (8 - LUT_BITS);
                     int bQ = b >> (8 - LUT_BITS);
 
                     int idx = ((rQ * LUT_SIZE + gQ) * LUT_SIZE + bQ);
-                    dRow[x] = _lut32[idx];
+                    uint mapped = _lut32[idx];
+
+                    if (mapped != 0)
+                    {
+                        // Match: write shifted color (opaque)
+                        dRow[x] = mapped;
+                    }
+                    else
+                    {
+                        dRow[x] = src;
+                    }
                 }
             }
         }
 
 
 
+
+
         private void BuildLut()
         {
-            // Precompute mapping for each quantized RGB.
-            // For each bin, we pick the bin center value to compute HSV + match targets.
             for (int rQ = 0; rQ < LUT_SIZE; rQ++)
             {
                 byte r = (byte)((rQ * 255 + (LUT_SIZE - 1) / 2) / (LUT_SIZE - 1));
@@ -488,20 +500,18 @@ namespace ScreenColourReplacer
                         if (match)
                         {
                             HsvToRgb(_targetHueDeg, s, v, out byte rr, out byte gg, out byte bb);
-
-                            // WriteableBitmap is BGRA in memory.
-                            // Pack as 0xAARRGGBB so little-endian bytes are BB GG RR AA.
                             _lut32[idx] = (uint)(bb | (gg << 8) | (rr << 16) | (255u << 24));
                         }
                         else
                         {
-                            _lut32[idx] = 0u; // transparent
+                            // put a sentinel with A=0 to mean "not a match"
+                            _lut32[idx] = 0u;
                         }
-
                     }
                 }
             }
         }
+
 
         // ---------- Hue matching config (your targets) ----------
         private const int DEFAULT_TARGET_HUE_DEG = 285;
@@ -817,11 +827,7 @@ namespace ScreenColourReplacer
 
             public void CaptureExcelClientOrFallback(IntPtr hwnd, IntPtr screenDc, int screenX, int screenY)
             {
-                if (!CaptureExcelClient(hwnd))
-                {
-                    // Fallback: copy from screen (client rect position).
-                    CaptureScreenRegion(screenDc, screenX, screenY);
-                }
+                CaptureScreenRegion(screenDc, screenX, screenY);
             }
 
             public void Dispose()
