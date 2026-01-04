@@ -9,6 +9,7 @@ using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using System.Buffers.Binary;
 using System.IO.Hashing;
+using System.Runtime.CompilerServices;
 
 
 namespace ScreenColourReplacer
@@ -162,29 +163,63 @@ namespace ScreenColourReplacer
                         // Capture ONCE for the whole Excel client
                         cc.CaptureExcelClientOrFallback(w.Hwnd, screenDc, w.Rect.Left, w.Rect.Top);
 
-                        // Dirty-check ONCE for the whole captured client
+                        // Compute visible rects first (screen-space) and clip to virtual screen.
+                        // We'll use this list BOTH for clearing and drawing.
+                        var visiblesRaw = GetVisibleExcelRects(w.Hwnd, w.Rect);
+
+                        var visibles = new List<RECT>(visiblesRaw.Count);
+                        foreach (var vr in visiblesRaw)
+                        {
+                            if (ClipToVirtualScreen(vr, out var cap))
+                                visibles.Add(cap);
+                        }
+
+                        // Visibility signature (changes when Excel goes behind something / uncovered)
+                        ulong visSig = ComputeRectsSignature(visibles);
+
+                        // Capture ONCE for the whole Excel client
+                        cc.CaptureExcelClientOrFallback(w.Hwnd, screenDc, w.Rect.Left, w.Rect.Top);
+
+                        // Pixel signature (content changes)
                         ulong sig = ComputeSignatureFull(cc.BitsPtr, cc.SrcStride, fullW, fullH);
-                        if (cc.HasLastSig && sig == cc.LastSig)
+
+                        // Decide if we must update: content OR visibility changed
+                        bool contentChanged = !cc.HasLastSig || sig != cc.LastSig;
+                        bool visChanged = !cc.HasLastVisSig || visSig != cc.LastVisSig;
+
+                        if (!contentChanged && !visChanged)
                             continue;
 
+                        // ---- IMPORTANT: clear what we drew last time for this hwnd ----
+                        foreach (var old in cc.LastVisibleRects)
+                        {
+                            // old is already clipped to virtual screen
+                            int oldDstX = old.Left - _vsLeft;
+                            int oldDstY = old.Top - _vsTop;
+                            ClearBackBufferRect(dstBackBuffer, dstStride, oldDstX, oldDstY, old.Width, old.Height);
+
+                            _overlay.AddDirtyRect(new Int32Rect(oldDstX, oldDstY, old.Width, old.Height));
+                        }
+
+                        // Update stored signatures + rects
                         cc.LastSig = sig;
                         cc.HasLastSig = true;
 
-                        // Now compute visible rects (to avoid painting over occluders)
-                        var visibles = GetVisibleExcelRects(w.Hwnd, w.Rect);
+                        cc.LastVisSig = visSig;
+                        cc.HasLastVisSig = true;
 
-                        foreach (var vr in visibles)
+                        cc.LastVisibleRects.Clear();
+                        cc.LastVisibleRects.AddRange(visibles);
+
+                        // ---- Draw current visible rects ----
+                        foreach (var cap in visibles) // cap already clipped
                         {
-                            if (!ClipToVirtualScreen(vr, out var cap)) continue;
-
                             int capW = cap.Width;
                             int capH = cap.Height;
 
-                            // Source offsets inside the captured Excel client buffer
                             int srcX = cap.Left - w.Rect.Left;
                             int srcY = cap.Top - w.Rect.Top;
 
-                            // Destination offsets inside the overlay
                             int dstX = cap.Left - _vsLeft;
                             int dstY = cap.Top - _vsTop;
 
@@ -197,6 +232,7 @@ namespace ScreenColourReplacer
 
                             _overlay.AddDirtyRect(new Int32Rect(dstX, dstY, capW, capH));
                         }
+
                     }
                 }
                 finally
@@ -212,6 +248,23 @@ namespace ScreenColourReplacer
 
             CleanupCacheForClosedWindows(wins);
         }
+
+        private unsafe void ClearBackBufferRect(
+            IntPtr dstBackBuffer, int dstStride,
+            int dstX, int dstY,
+            int w, int h)
+        {
+            if (w <= 0 || h <= 0) return;
+
+            byte* basePtr = (byte*)dstBackBuffer.ToPointer();
+
+            for (int y = 0; y < h; y++)
+            {
+                byte* row = basePtr + (dstY + y) * dstStride + dstX * 4;
+                Unsafe.InitBlockUnaligned(row, 0, (uint)(w * 4)); // set BGRA bytes to 0 => transparent
+            }
+        }
+
 
 
         // ---------- Region clipping ----------
@@ -399,6 +452,37 @@ namespace ScreenColourReplacer
             (147.22f, 12f, 0.18f), // #0F703B / #107C41-ish
         };
 
+        private static ulong ComputeRectsSignature(List<RECT> rects)
+        {
+            // Order-independent signature: sort a copy-like by sorting in-place on the list we already built.
+            rects.Sort((a, b) =>
+            {
+                int c = a.Top.CompareTo(b.Top);
+                if (c != 0) return c;
+                c = a.Left.CompareTo(b.Left);
+                if (c != 0) return c;
+                c = a.Bottom.CompareTo(b.Bottom);
+                if (c != 0) return c;
+                return a.Right.CompareTo(b.Right);
+            });
+
+            const ulong OFFSET = 1469598103934665603UL;
+            const ulong PRIME = 1099511628211UL;
+
+            ulong h = OFFSET;
+            h ^= (ulong)(uint)rects.Count; h *= PRIME;
+
+            foreach (var r in rects)
+            {
+                h ^= (ulong)(uint)r.Left; h *= PRIME;
+                h ^= (ulong)(uint)r.Top; h *= PRIME;
+                h ^= (ulong)(uint)r.Right; h *= PRIME;
+                h ^= (ulong)(uint)r.Bottom; h *= PRIME;
+            }
+            return h;
+        }
+
+
         private static bool MatchesAnyTarget(float hDeg, float s, float v)
         {
             if (v < MIN_V) return false;
@@ -576,6 +660,11 @@ namespace ScreenColourReplacer
             private readonly IntPtr _hBmp;
             private readonly IntPtr _oldObj;
             private readonly IntPtr _bitsPtr;
+
+            public ulong LastVisSig;
+            public bool HasLastVisSig;
+            public readonly List<RECT> LastVisibleRects = new(); // screen-space, already clipped to virtual screen
+
 
             public CaptureCache(int w, int h)
             {
