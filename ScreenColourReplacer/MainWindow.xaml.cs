@@ -259,7 +259,7 @@ namespace ScreenColourReplacer
                     }
 
                     // Visibility signature (changes when Excel goes behind something / uncovered)
-                    ulong visSig = ComputeRectsSignature(visibles);
+                    ulong visSig = ComputeRectsSignature_NoSort(visibles);
 
                     // Capture ONCE for the whole Excel client
                     cc.CaptureExcelClientOrFallback(w.Hwnd, screenDc, w.Rect.Left, w.Rect.Top);
@@ -527,6 +527,7 @@ namespace ScreenColourReplacer
 
 
         // ---------- LUT application ----------
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         private unsafe void ApplyLutToBackBuffer_WithSrcOffset(
             IntPtr srcBits, int srcStride,
             IntPtr dstBackBuffer, int dstStride,
@@ -537,41 +538,30 @@ namespace ScreenColourReplacer
             byte* srcBase = (byte*)srcBits.ToPointer();
             byte* dstBase = (byte*)dstBackBuffer.ToPointer();
 
+            const int shift = 8 - LUT_BITS;
+
             for (int y = 0; y < h; y++)
             {
-                byte* sRow = srcBase + (srcY + y) * srcStride + srcX * 4;
-                uint* dRow = (uint*)(dstBase + (dstY + y) * dstStride + dstX * 4);
+                uint* s = (uint*)(srcBase + (srcY + y) * srcStride) + srcX;
+                uint* d = (uint*)(dstBase + (dstY + y) * dstStride) + dstX;
 
                 for (int x = 0; x < w; x++)
                 {
-                    int si = x * 4;
+                    uint src = s[x] | 0xFF000000u; // force opaque alpha
 
-                    // Read source as a packed pixel (BGRA in memory)
-                    uint src = *(uint*)(sRow + si) | 0xFF000000u;
+                    // BGRA in memory: B 0..7, G 8..15, R 16..23
+                    int bQ = (int)((src >> shift) & LUT_MASK);
+                    int gQ = (int)((src >> (8 + shift)) & LUT_MASK);
+                    int rQ = (int)((src >> (16 + shift)) & LUT_MASK);
 
-                    byte b = (byte)(src & 0xFF);
-                    byte g = (byte)((src >> 8) & 0xFF);
-                    byte r = (byte)((src >> 16) & 0xFF);
+                    int idx = (rQ << (2 * LUT_BITS)) | (gQ << LUT_BITS) | bQ;
 
-                    int rQ = r >> (8 - LUT_BITS);
-                    int gQ = g >> (8 - LUT_BITS);
-                    int bQ = b >> (8 - LUT_BITS);
-
-                    int idx = ((rQ * LUT_SIZE + gQ) * LUT_SIZE + bQ);
                     uint mapped = _lut32[idx];
-
-                    if (mapped != 0)
-                    {
-                        // Match: write shifted color (opaque)
-                        dRow[x] = mapped;
-                    }
-                    else
-                    {
-                        dRow[x] = src;
-                    }
+                    d[x] = (mapped != 0) ? mapped : src;
                 }
             }
         }
+
 
 
 
@@ -633,35 +623,36 @@ namespace ScreenColourReplacer
             (161.94f, 12f, 0.18f), // #6ED5B6-ish
         };
 
-        private static ulong ComputeRectsSignature(List<RECT> rects)
+        private static ulong ComputeRectsSignature_NoSort(List<RECT> rects)
         {
-            // Order-independent signature: sort a copy-like by sorting in-place on the list we already built.
-            rects.Sort((a, b) =>
-            {
-                int c = a.Top.CompareTo(b.Top);
-                if (c != 0) return c;
-                c = a.Left.CompareTo(b.Left);
-                if (c != 0) return c;
-                c = a.Bottom.CompareTo(b.Bottom);
-                if (c != 0) return c;
-                return a.Right.CompareTo(b.Right);
-            });
-
             const ulong OFFSET = 1469598103934665603UL;
             const ulong PRIME = 1099511628211UL;
 
-            ulong h = OFFSET;
-            h ^= (ulong)(uint)rects.Count; h *= PRIME;
+            ulong x = OFFSET;
+            ulong s = 0;
 
-            foreach (var r in rects)
+            x ^= (ulong)(uint)rects.Count; x *= PRIME;
+
+            for (int i = 0; i < rects.Count; i++)
             {
+                var r = rects[i];
+
+                ulong h = OFFSET;
                 h ^= (ulong)(uint)r.Left; h *= PRIME;
                 h ^= (ulong)(uint)r.Top; h *= PRIME;
                 h ^= (ulong)(uint)r.Right; h *= PRIME;
                 h ^= (ulong)(uint)r.Bottom; h *= PRIME;
+
+                x ^= h;
+                s += h * PRIME;
             }
-            return h;
+
+            // mix
+            x ^= s + 0x9E3779B97F4A7C15UL;
+            x *= PRIME;
+            return x;
         }
+
 
         private void LoadHueFromConfig()
         {
