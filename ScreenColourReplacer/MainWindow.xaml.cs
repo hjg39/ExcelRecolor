@@ -112,7 +112,7 @@ namespace ScreenColourReplacer
             SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle);
 
             // Prevent overlay being included in the capture (stops feedback flicker)
-            SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+            //SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
         }
 
         private void Tick()
