@@ -174,6 +174,60 @@ namespace ScreenColourReplacer
             return BinaryPrimitives.ReadUInt64LittleEndian(out8);
         }
 
+        private unsafe ulong ComputeSignatureVisibleRects(
+    IntPtr bits,
+    int stride,
+    in RECT excelRect,          // full Excel rect (screen coords)
+    List<RECT> visibles)        // screen coords, clipped
+        {
+            // Make order stable (avoids spurious changes due to rect ordering)
+            visibles.Sort((a, b) =>
+            {
+                int c = a.Top.CompareTo(b.Top);
+                if (c != 0) return c;
+                c = a.Left.CompareTo(b.Left);
+                if (c != 0) return c;
+                c = a.Bottom.CompareTo(b.Bottom);
+                if (c != 0) return c;
+                return a.Right.CompareTo(b.Right);
+            });
+
+            byte* p = (byte*)bits.ToPointer();
+            var hasher = new XxHash3();
+
+            // include rect metadata so different placements don’t collide
+            Span<byte> tmp = stackalloc byte[16];
+
+            for (int i = 0; i < visibles.Count; i++)
+            {
+                var r = visibles[i];
+
+                int srcX = r.Left - excelRect.Left;
+                int srcY = r.Top - excelRect.Top;
+                int w = r.Width;
+                int h = r.Height;
+
+                // Rect header
+                BinaryPrimitives.WriteInt32LittleEndian(tmp.Slice(0, 4), srcX);
+                BinaryPrimitives.WriteInt32LittleEndian(tmp.Slice(4, 4), srcY);
+                BinaryPrimitives.WriteInt32LittleEndian(tmp.Slice(8, 4), w);
+                BinaryPrimitives.WriteInt32LittleEndian(tmp.Slice(12, 4), h);
+                hasher.Append(tmp);
+
+                int rowBytes = w * 4;
+                for (int y = 0; y < h; y++)
+                {
+                    var row = new ReadOnlySpan<byte>(p + (srcY + y) * stride + srcX * 4, rowBytes);
+                    hasher.Append(row);
+                }
+            }
+
+            Span<byte> out8 = stackalloc byte[8];
+            hasher.GetCurrentHash(out8);
+            return BinaryPrimitives.ReadUInt64LittleEndian(out8);
+        }
+
+
         protected override void OnSourceInitialized(EventArgs e)
         {
             base.OnSourceInitialized(e);
@@ -238,7 +292,7 @@ namespace ScreenColourReplacer
             {
                 var w = wins[wi];
 
-                if (!ClipToVirtualScreen(w.Rect, out _)) continue;
+                if (!ClipToVirtualScreen(w.Rect, out var fullCap)) continue; // fullCap = Excel clipped to virtual screen
 
                 int fullW = w.Rect.Width;
                 int fullH = w.Rect.Height;
@@ -269,27 +323,53 @@ namespace ScreenColourReplacer
                 ulong visSig = ComputeRectsSignature_NoSort(visibles);
                 bool visChanged = !cc.HasLastVisSig || visSig != cc.LastVisSig;
 
+                // If fully hidden, don't capture/hash; just clear last drawn if visibility changed
+                if (visibles.Count == 0)
+                {
+                    if (!visChanged)
+                        continue;
+
+                    cc.LastVisSig = visSig;
+                    cc.HasLastVisSig = true;
+
+                    _jobs.Add(new DrawJob { Cc = cc, ExcelRect = w.Rect, Visibles = visibles });
+                    continue;
+                }
+
+                // Fully visible if the only visible rect == fullCap
+                bool fullyVisible = (visibles.Count == 1 && RectsEqual(visibles[0], fullCap));
+
+                ulong sig;
+
                 // Capture + hash (outside lock)
-                cc.CaptureExcelClientOrFallback(w.Hwnd, screenDc, w.Rect.Left, w.Rect.Top);
-                ulong sig = ComputeSignatureFull(cc.BitsPtr, cc.SrcStride, fullW, fullH);
+                if (fullyVisible)
+                {
+                    // Full capture + full hash
+                    cc.CaptureScreenRegion(screenDc, w.Rect.Left, w.Rect.Top); // same as your current fallback
+                    sig = ComputeSignatureFull(cc.BitsPtr, cc.SrcStride, fullW, fullH);
+                }
+                else
+                {
+                    // Only capture visible pieces + hash only those pieces
+                    cc.CaptureVisibleRects(screenDc, w.Rect, visibles);
+                    sig = ComputeSignatureVisibleRects(cc.BitsPtr, cc.SrcStride, w.Rect, visibles);
+                }
 
                 bool contentChanged = !cc.HasLastSig || sig != cc.LastSig;
 
                 if (!contentChanged && !visChanged)
                     continue;
 
-                // Update sig cache only when content changed
-                if (contentChanged)
-                {
-                    cc.LastSig = sig;
-                    cc.HasLastSig = true;
-                }
+                // Update sig cache (we computed sig in both branches above)
+                cc.LastSig = sig;
+                cc.HasLastSig = true;
 
-                // We’re going to redraw, so update vis cache now
+                // Update visibility cache
                 cc.LastVisSig = visSig;
                 cc.HasLastVisSig = true;
 
                 _jobs.Add(new DrawJob { Cc = cc, ExcelRect = w.Rect, Visibles = visibles });
+
             }
 
             // If nothing to draw and no stale to clear, we can skip lock entirely
@@ -590,11 +670,6 @@ namespace ScreenColourReplacer
                 }
             }
         }
-
-
-
-
-
 
         private void BuildLut()
         {
