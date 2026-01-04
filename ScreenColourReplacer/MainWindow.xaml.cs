@@ -74,6 +74,9 @@ namespace ScreenColourReplacer
 
         private int _inTick;
 
+        private readonly List<ExcelWin> _wins = new(4);
+        private readonly StringBuilder _classSb = new(16);
+
         public MainWindow()
         {
             InitializeComponent();
@@ -180,7 +183,7 @@ namespace ScreenColourReplacer
         {
             if (_overlay == null) return;
 
-            var wins = GetExcelWindows();
+            var wins = GetExcelWindows_Reused();
 
             // 1) Compute stale regions (moved/closed Excel windows) BEFORE lock, but DO NOT clear yet
             CollectStaleRegions(_lastWins, wins, _staleRects);
@@ -798,18 +801,19 @@ namespace ScreenColourReplacer
         [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
         [DllImport("user32.dll")] private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
 
-        private static List<ExcelWin> GetExcelWindows()
+        private List<ExcelWin> GetExcelWindows_Reused()
         {
-            var wins = new List<ExcelWin>(4);
+            _wins.Clear();
 
             EnumWindows((hWnd, _) =>
             {
                 if (!IsWindowVisible(hWnd) || IsIconic(hWnd)) return true;
 
-                var sb = new StringBuilder(256);
-                GetClassName(hWnd, sb, sb.Capacity);
-                if (!string.Equals(sb.ToString(), EXCEL_CLASS, StringComparison.Ordinal))
-                    return true;
+                _classSb.Clear();
+                GetClassName(hWnd, _classSb, _classSb.Capacity);
+
+                // Compare without ToString()
+                if (!IsExcelClass(_classSb)) return true;
 
                 if (!GetClientRect(hWnd, out var rcClient)) return true;
                 if (rcClient.Width <= 0 || rcClient.Height <= 0) return true;
@@ -819,12 +823,20 @@ namespace ScreenColourReplacer
                 ClientToScreen(hWnd, ref tl);
                 ClientToScreen(hWnd, ref br);
 
-                var screenRect = new RECT { Left = tl.X, Top = tl.Y, Right = br.X, Bottom = br.Y };
-                wins.Add(new ExcelWin(hWnd, screenRect));
+                _wins.Add(new ExcelWin(hWnd, new RECT { Left = tl.X, Top = tl.Y, Right = br.X, Bottom = br.Y }));
                 return true;
             }, IntPtr.Zero);
 
-            return wins;
+            return _wins;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool IsExcelClass(StringBuilder sb)
+        {
+            // "XLMAIN"
+            return sb.Length == 6 &&
+                   sb[0] == 'X' && sb[1] == 'L' && sb[2] == 'M' &&
+                   sb[3] == 'A' && sb[4] == 'I' && sb[5] == 'N';
         }
 
         private void RemoveOtherSizesForHwnd(IntPtr hwnd, int keepW, int keepH)
