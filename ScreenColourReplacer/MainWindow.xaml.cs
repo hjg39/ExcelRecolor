@@ -279,8 +279,22 @@ namespace ScreenColourReplacer
                     IntPtr dstBackBuffer = _overlay.BackBuffer;
                     int dstStride = _overlay.BackBufferStride;
 
+                    RECT dirty = default;
+                    bool hasDirty = false;
+
                     for (int i = 0; i < _staleRects.Count; i++)
-                        ClearBackBufferRect_ScreenSpace(dstBackBuffer, dstStride, _staleRects[i]);
+                    {
+                        var r = _staleRects[i];
+                        ClearBackBufferRect_ScreenSpace(dstBackBuffer, dstStride, r);
+                        UnionInto(ref dirty, ref hasDirty, r);
+                    }
+
+                    if (hasDirty)
+                    {
+                        int x = dirty.Left - _vsLeft;
+                        int y = dirty.Top - _vsTop;
+                        _overlay.AddDirtyRect(new Int32Rect(x, y, dirty.Width, dirty.Height));
+                    }
                 }
                 finally
                 {
@@ -401,9 +415,16 @@ namespace ScreenColourReplacer
                 IntPtr dstBackBuffer = _overlay.BackBuffer;
                 int dstStride = _overlay.BackBufferStride;
 
+                RECT dirty = default;
+                bool hasDirty = false;
+
                 // Clear stale rects
                 for (int i = 0; i < _staleRects.Count; i++)
-                    ClearBackBufferRect_ScreenSpace(dstBackBuffer, dstStride, _staleRects[i]);
+                {
+                    var r = _staleRects[i];
+                    ClearBackBufferRect_ScreenSpace(dstBackBuffer, dstStride, r);
+                    UnionInto(ref dirty, ref hasDirty, r);
+                }
 
                 // Draw jobs
                 for (int j = 0; j < _jobs.Count; j++)
@@ -415,7 +436,11 @@ namespace ScreenColourReplacer
 
                     // Clear what we drew last time for this hwnd
                     for (int i = 0; i < cc.LastVisibleRects.Count; i++)
-                        ClearBackBufferRect_ScreenSpace(dstBackBuffer, dstStride, cc.LastVisibleRects[i]);
+                    {
+                        var r = cc.LastVisibleRects[i];
+                        ClearBackBufferRect_ScreenSpace(dstBackBuffer, dstStride, r);
+                        UnionInto(ref dirty, ref hasDirty, r);
+                    }
 
                     // Update stored visibility rects
                     cc.LastVisibleRects.Clear();
@@ -442,8 +467,16 @@ namespace ScreenColourReplacer
                             dstX, dstY,
                             capW, capH);
 
-                        _overlay.AddDirtyRect(new Int32Rect(dstX, dstY, capW, capH));
+                        UnionInto(ref dirty, ref hasDirty, cap);
                     }
+                }
+
+                // ONE dirty rect for everything touched this tick
+                if (hasDirty)
+                {
+                    int x = dirty.Left - _vsLeft;
+                    int y = dirty.Top - _vsTop;
+                    _overlay.AddDirtyRect(new Int32Rect(x, y, dirty.Width, dirty.Height));
                 }
             }
             finally
@@ -617,9 +650,8 @@ namespace ScreenColourReplacer
             int dstY = cap.Top - _vsTop;
 
             ClearBackBufferRect(dstBackBuffer, dstStride, dstX, dstY, w, h);
-
-            _overlay!.AddDirtyRect(new Int32Rect(dstX, dstY, w, h));
         }
+
 
         private bool IsIgnoredOccluderWindow(IntPtr hwnd)
         {
@@ -715,6 +747,25 @@ namespace ScreenColourReplacer
                 _cache.Remove(key);
             }
         }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void UnionInto(ref RECT u, ref bool has, in RECT r)
+        {
+            if (r.Width <= 0 || r.Height <= 0) return;
+
+            if (!has)
+            {
+                u = r;
+                has = true;
+                return;
+            }
+
+            u.Left = Math.Min(u.Left, r.Left);
+            u.Top = Math.Min(u.Top, r.Top);
+            u.Right = Math.Max(u.Right, r.Right);
+            u.Bottom = Math.Max(u.Bottom, r.Bottom);
+        }
+
 
         // ---------- LUT application ----------
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
