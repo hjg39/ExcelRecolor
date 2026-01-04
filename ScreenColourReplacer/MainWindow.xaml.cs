@@ -10,6 +10,7 @@ using System.Windows.Threading;
 using System.Buffers.Binary;
 using System.IO.Hashing;
 using System.Runtime.CompilerServices;
+using System.IO;
 
 
 namespace ScreenColourReplacer
@@ -30,7 +31,7 @@ namespace ScreenColourReplacer
     public partial class MainWindow : Window
     {
         // ---------- Perf knobs ----------
-        private const int TIMER_MS = 50; // 20 FPS-ish. Try 33 for 30 FPS, 100 for 10 FPS.
+        private const int TIMER_MS = 6; // 20 FPS-ish. Try 33 for 30 FPS, 100 for 10 FPS.
         private const int LUT_BITS = 5;  // 5 => 32 levels/channel (32^3 = 32768)
         private const int LUT_SIZE = 1 << LUT_BITS;
         private const int LUT_MASK = LUT_SIZE - 1;
@@ -52,6 +53,9 @@ namespace ScreenColourReplacer
         private List<ExcelWin> _lastWins = new();
 
         private readonly uint[] _lut32 = new uint[LUT_SIZE * LUT_SIZE * LUT_SIZE]; // packed BGRA in little-endian
+
+        private readonly Dictionary<uint, bool> _pidIsIgnoredOccluder = new();
+        private int _pidCacheSweepCounter = 0;
 
         public MainWindow()
         {
@@ -161,7 +165,7 @@ namespace ScreenColourReplacer
                         }
 
                         // Capture ONCE for the whole Excel client
-                        cc.CaptureExcelClientOrFallback(w.Hwnd, screenDc, w.Rect.Left, w.Rect.Top);
+                        //cc.CaptureExcelClientOrFallback(w.Hwnd, screenDc, w.Rect.Left, w.Rect.Top);
 
                         // Compute visible rects first (screen-space) and clip to virtual screen.
                         // We'll use this list BOTH for clearing and drawing.
@@ -248,6 +252,54 @@ namespace ScreenColourReplacer
 
             CleanupCacheForClosedWindows(wins);
         }
+
+        private bool IsIgnoredOccluderWindow(IntPtr hwnd)
+        {
+            uint pid;
+            GetWindowThreadProcessId(hwnd, out pid);
+            if (pid == 0) return false;
+
+            // Very cheap periodic cache reset (every ~2000 occluder checks)
+            if (++_pidCacheSweepCounter > 2000)
+            {
+                _pidCacheSweepCounter = 0;
+                _pidIsIgnoredOccluder.Clear();
+            }
+
+            if (_pidIsIgnoredOccluder.TryGetValue(pid, out bool cached))
+                return cached;
+
+            bool ignored = false;
+
+            IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (hProc != IntPtr.Zero)
+            {
+                try
+                {
+                    var sb = new StringBuilder(1024);
+                    int size = sb.Capacity;
+                    if (QueryFullProcessImageName(hProc, 0, sb, ref size))
+                    {
+                        string exe = Path.GetFileName(sb.ToString());
+
+                        // Snipping Tool / clipping overlay (most common)
+                        if (exe.Equals("ScreenClippingHost.exe", StringComparison.OrdinalIgnoreCase) ||
+                            exe.Equals("SnippingTool.exe", StringComparison.OrdinalIgnoreCase))
+                        {
+                            ignored = true;
+                        }
+                    }
+                }
+                finally
+                {
+                    CloseHandle(hProc);
+                }
+            }
+
+            _pidIsIgnoredOccluder[pid] = ignored;
+            return ignored;
+        }
+
 
         private unsafe void ClearBackBufferRect(
             IntPtr dstBackBuffer, int dstStride,
@@ -805,6 +857,19 @@ namespace ScreenColourReplacer
         private const uint PW_CLIENTONLY = 0x00000001;
         private const uint PW_RENDERFULLCONTENT = 0x00000002; // harmless if ignored
 
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool QueryFullProcessImageName(IntPtr hProcess, int dwFlags, StringBuilder lpExeName, ref int lpdwSize);
+
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
         private static bool Intersect(in RECT a, in RECT b, out RECT r)
         {
@@ -854,6 +919,7 @@ namespace ScreenColourReplacer
             for (IntPtr h = GetTopWindow(IntPtr.Zero); h != IntPtr.Zero && h != excelHwnd; h = GetWindow(h, GW_HWNDNEXT))
             {
                 if (!IsWindowVisible(h) || IsIconic(h)) continue;
+                if (IsIgnoredOccluderWindow(h)) continue;
 
                 // Skip our own overlay window if it ever appears in enumeration
                 if (h == new WindowInteropHelper(this).Handle) continue;
