@@ -10,6 +10,19 @@ using System.Windows.Threading;
 
 namespace ScreenColourReplacer
 {
+    readonly struct CacheKey : IEquatable<CacheKey>
+    {
+        public CacheKey(IntPtr hwnd, int w, int h) { Hwnd = hwnd; W = w; H = h; }
+        public readonly IntPtr Hwnd;
+        public readonly int W;
+        public readonly int H;
+
+        public bool Equals(CacheKey other) => Hwnd == other.Hwnd && W == other.W && H == other.H;
+        public override bool Equals(object? obj) => obj is CacheKey other && Equals(other);
+        public override int GetHashCode() => HashCode.Combine(Hwnd, W, H);
+    }
+
+
     public partial class MainWindow : Window
     {
         // ---------- Perf knobs ----------
@@ -28,7 +41,8 @@ namespace ScreenColourReplacer
         };
 
         // Cache per Excel window (buffer reuse)
-        private readonly Dictionary<IntPtr, CaptureCache> _cache = new();
+        private readonly Dictionary<CacheKey, CaptureCache> _cache = new();
+
 
         // Last seen windows for "clear stale regions"
         private List<ExcelWin> _lastWins = new();
@@ -102,29 +116,37 @@ namespace ScreenColourReplacer
             foreach (var w in wins)
             {
                 // Clip to virtual screen
-                if (!ClipToVirtualScreen(w.Rect, out var cap)) continue;
+                var visibles = GetVisibleExcelRects(w.Hwnd, w.Rect);
 
-                int capW = cap.Width;
-                int capH = cap.Height;
-
-                // Get/reuse cache for this hwnd and size
-                if (!_cache.TryGetValue(w.Hwnd, out var cc) || cc.Width != capW || cc.Height != capH)
+                foreach (var vr in visibles)
                 {
-                    cc?.Dispose();
-                    cc = new CaptureCache(capW, capH);
-                    _cache[w.Hwnd] = cc;
+                    // Clip to virtual screen
+                    if (!ClipToVirtualScreen(vr, out var cap)) continue;
+
+                    int capW = cap.Width;
+                    int capH = cap.Height;
+
+                    // Get/reuse cache for this hwnd and size
+                    var key = new CacheKey(w.Hwnd, capW, capH);
+
+                    if (!_cache.TryGetValue(key, out var cc))
+                    {
+                        cc = new CaptureCache(capW, capH);
+                        _cache[key] = cc;
+                    }
+
+                    // Capture visible region
+                    cc.CaptureScreenRegion(cap.Left, cap.Top);
+
+                    // Apply LUT
+                    ApplyLut(cc.SrcBytes, cc.SrcStride, cc.MaskBytes, cc.MaskStride, capW, capH);
+
+                    // Write to overlay at correct offset
+                    int destX = cap.Left - _vsLeft;
+                    int destY = cap.Top - _vsTop;
+                    _overlay.WritePixels(new Int32Rect(destX, destY, capW, capH), cc.MaskBytes, cc.MaskStride, 0);
                 }
 
-                // Capture cap region into cc.SrcBytes (BGRA32)
-                cc.CaptureScreenRegion(cap.Left, cap.Top);
-
-                // Build mask in cc.MaskBytes using LUT (BGRA32)
-                ApplyLut(cc.SrcBytes, cc.SrcStride, cc.MaskBytes, cc.MaskStride, capW, capH);
-
-                // Write to overlay at correct offset
-                int destX = cap.Left - _vsLeft;
-                int destY = cap.Top - _vsTop;
-                _overlay.WritePixels(new Int32Rect(destX, destY, capW, capH), cc.MaskBytes, cc.MaskStride, 0);
             }
 
             // Optional: clean caches for Excel windows that closed
@@ -200,28 +222,31 @@ namespace ScreenColourReplacer
 
         private void CleanupCacheForClosedWindows(List<ExcelWin> wins)
         {
-            // Remove caches for hwnds not present anymore
+            // Alive Excel hwnds
             var alive = new HashSet<IntPtr>();
             foreach (var w in wins) alive.Add(w.Hwnd);
 
-            // Collect to delete (avoid modifying dictionary while iterating)
-            List<IntPtr>? toDelete = null;
+            // Collect keys to delete (cache is keyed by CacheKey now)
+            List<CacheKey>? toDelete = null;
+
             foreach (var kv in _cache)
             {
-                if (!alive.Contains(kv.Key))
+                if (!alive.Contains(kv.Key.Hwnd))
                 {
-                    toDelete ??= new List<IntPtr>();
+                    toDelete ??= new List<CacheKey>();
                     toDelete.Add(kv.Key);
                 }
             }
+
             if (toDelete == null) return;
 
-            foreach (var h in toDelete)
+            foreach (var key in toDelete)
             {
-                _cache[h].Dispose();
-                _cache.Remove(h);
+                _cache[key].Dispose();
+                _cache.Remove(key);
             }
         }
+
 
         // ---------- LUT application ----------
         private void ApplyLut(byte[] srcBGRA, int srcStride, byte[] dstBGRA, int dstStride, int w, int h)
@@ -587,5 +612,86 @@ namespace ScreenColourReplacer
         private static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint dwAffinity);
 
         private const uint WDA_EXCLUDEFROMCAPTURE = 0x11;
+
+        private const uint GW_HWNDFIRST = 0;
+        private const uint GW_HWNDNEXT = 2;
+
+        [DllImport("user32.dll")] private static extern IntPtr GetTopWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+        [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+        [DllImport("user32.dll")] private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        private static bool Intersect(in RECT a, in RECT b, out RECT r)
+        {
+            int l = Math.Max(a.Left, b.Left);
+            int t = Math.Max(a.Top, b.Top);
+            int rr = Math.Min(a.Right, b.Right);
+            int bb = Math.Min(a.Bottom, b.Bottom);
+            r = new RECT { Left = l, Top = t, Right = rr, Bottom = bb };
+            return r.Width > 0 && r.Height > 0;
+        }
+
+        private static List<RECT> SubtractRect(RECT src, RECT cut)
+        {
+            // Returns up to 4 rectangles (src minus cut)
+            var res = new List<RECT>(4);
+
+            if (!Intersect(src, cut, out var i))
+            {
+                res.Add(src);
+                return res;
+            }
+
+            // Top band
+            if (src.Top < i.Top)
+                res.Add(new RECT { Left = src.Left, Top = src.Top, Right = src.Right, Bottom = i.Top });
+
+            // Bottom band
+            if (i.Bottom < src.Bottom)
+                res.Add(new RECT { Left = src.Left, Top = i.Bottom, Right = src.Right, Bottom = src.Bottom });
+
+            // Left band
+            if (src.Left < i.Left)
+                res.Add(new RECT { Left = src.Left, Top = i.Top, Right = i.Left, Bottom = i.Bottom });
+
+            // Right band
+            if (i.Right < src.Right)
+                res.Add(new RECT { Left = i.Right, Top = i.Top, Right = src.Right, Bottom = i.Bottom });
+
+            return res;
+        }
+
+        private List<RECT> GetVisibleExcelRects(IntPtr excelHwnd, RECT excelRect)
+        {
+            // Start with the full Excel rect, subtract occluders above it.
+            var visible = new List<RECT> { excelRect };
+
+            for (IntPtr h = GetTopWindow(IntPtr.Zero); h != IntPtr.Zero && h != excelHwnd; h = GetWindow(h, GW_HWNDNEXT))
+            {
+                if (!IsWindowVisible(h) || IsIconic(h)) continue;
+
+                // Skip our own overlay window if it ever appears in enumeration
+                if (h == new WindowInteropHelper(this).Handle) continue;
+
+                // Optional: skip “empty” windows (tooltips etc.)
+                if (GetWindowTextLength(h) == 0) { /* you may want to keep these; leave as-is */ }
+
+                if (!GetWindowRect(h, out var wr)) continue;
+
+                // Only care if it overlaps Excel
+                if (!Intersect(wr, excelRect, out var overlap)) continue;
+
+                // Subtract this overlap from all current visible rects
+                var next = new List<RECT>(visible.Count * 2);
+                foreach (var v in visible)
+                    next.AddRange(SubtractRect(v, overlap));
+
+                visible = next;
+                if (visible.Count == 0) break;
+            }
+
+            return visible;
+        }
+
     }
 }
