@@ -10,14 +10,18 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.Drawing.Common" Version="10.0.1" />
-    <PackageReference Include="System.IO.Hashing" Version="10.0.1" />
+    <None Remove="ScreenColourReplacer.config" />
   </ItemGroup>
 
   <ItemGroup>
-    <None Update="ScreenColourReplacer.config">
+    <Content Include="ScreenColourReplacer.config">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </None>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Drawing.Common" Version="10.0.1" />
+    <PackageReference Include="System.IO.Hashing" Version="10.0.1" />
   </ItemGroup>
 
 </Project>
