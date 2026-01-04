@@ -36,6 +36,9 @@ namespace ScreenColourReplacer
         private const int LUT_SIZE = 1 << LUT_BITS;
         private const int LUT_MASK = LUT_SIZE - 1;
 
+        private readonly HashSet<IntPtr> _aliveHwnds = new();
+        private readonly List<CacheKey> _toDeleteKeys = new();
+
         // ---------- Overlay / desktop ----------
         private WriteableBitmap? _overlay;
         private int _vsLeft, _vsTop, _vsW, _vsH;
@@ -500,31 +503,23 @@ namespace ScreenColourReplacer
 
         private void CleanupCacheForClosedWindows(List<ExcelWin> wins)
         {
-            // Alive Excel hwnds
-            var alive = new HashSet<IntPtr>();
-            foreach (var w in wins) alive.Add(w.Hwnd);
+            _aliveHwnds.Clear();
+            for (int i = 0; i < wins.Count; i++)
+                _aliveHwnds.Add(wins[i].Hwnd);
 
-            // Collect keys to delete (cache is keyed by CacheKey now)
-            List<CacheKey>? toDelete = null;
+            _toDeleteKeys.Clear();
 
             foreach (var kv in _cache)
-            {
-                if (!alive.Contains(kv.Key.Hwnd))
-                {
-                    toDelete ??= new List<CacheKey>();
-                    toDelete.Add(kv.Key);
-                }
-            }
+                if (!_aliveHwnds.Contains(kv.Key.Hwnd))
+                    _toDeleteKeys.Add(kv.Key);
 
-            if (toDelete == null) return;
-
-            foreach (var key in toDelete)
+            for (int i = 0; i < _toDeleteKeys.Count; i++)
             {
+                var key = _toDeleteKeys[i];
                 _cache[key].Dispose();
                 _cache.Remove(key);
             }
         }
-
 
         // ---------- LUT application ----------
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
