@@ -79,6 +79,11 @@ namespace ScreenColourReplacer
 
         private readonly List<DrawJob> _jobs = new(8);
 
+        private int _zOrderCountdown = 0;
+        private IntPtr _lastForeground = IntPtr.Zero;
+        private const int ZORDER_REFRESH_EVERY_N_TICKS = 3; // ~90ms at 30ms tick
+
+
         private struct DrawJob
         {
             public CaptureCache Cc;
@@ -186,22 +191,11 @@ namespace ScreenColourReplacer
 
 
         private unsafe ulong ComputeSignatureVisibleRects(
-    IntPtr bits,
-    int stride,
-    in RECT excelRect,          // full Excel rect (screen coords)
-    List<RECT> visibles)        // screen coords, clipped
+            IntPtr bits,
+            int stride,
+            in RECT excelRect,          // full Excel rect (screen coords)
+            List<RECT> visibles)        // screen coords, clipped
         {
-            // Make order stable (avoids spurious changes due to rect ordering)
-            visibles.Sort((a, b) =>
-            {
-                int c = a.Top.CompareTo(b.Top);
-                if (c != 0) return c;
-                c = a.Left.CompareTo(b.Left);
-                if (c != 0) return c;
-                c = a.Bottom.CompareTo(b.Bottom);
-                if (c != 0) return c;
-                return a.Right.CompareTo(b.Right);
-            });
 
             byte* p = (byte*)bits.ToPointer();
             var hasher = new XxHash3();
@@ -307,7 +301,24 @@ namespace ScreenColourReplacer
 
             // 2) Build occluder Z-order ONCE per tick (no lock)
             var interest = UnionAll(wins);
-            BuildZOrderCache(interest);
+
+            IntPtr fg = GetForegroundWindow();
+            bool fgChanged = fg != _lastForeground;
+            _lastForeground = fg;
+
+            // If Excel moved/appeared/disappeared this tick, stale rects will be non-empty.
+            bool excelChanged = _staleRects.Count != 0;
+
+            if (excelChanged || fgChanged || _zOrderCountdown <= 0)
+            {
+                BuildZOrderCache(interest);
+                _zOrderCountdown = ZORDER_REFRESH_EVERY_N_TICKS;
+            }
+            else
+            {
+                _zOrderCountdown--;
+            }
+
 
             // 3) Phase A: determine what needs drawing + capture/hash OUTSIDE overlay lock
             _jobs.Clear();
@@ -1314,6 +1325,10 @@ namespace ScreenColourReplacer
 
         [DllImport("user32.dll")]
         private static extern int GetSystemMetrics(int nIndex);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
 
         private const int SM_XVIRTUALSCREEN = 76;
         private const int SM_YVIRTUALSCREEN = 77;
