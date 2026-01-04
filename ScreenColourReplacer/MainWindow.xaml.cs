@@ -1,7 +1,8 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Drawing;
-using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media.Imaging;
@@ -11,150 +12,56 @@ namespace ScreenColourReplacer
 {
     public partial class MainWindow : Window
     {
-        private System.Collections.Generic.List<RECT> _lastExcelRects = new();
+        // ---------- Perf knobs ----------
+        private const int TIMER_MS = 50; // 20 FPS-ish. Try 33 for 30 FPS, 100 for 10 FPS.
+        private const int LUT_BITS = 5;  // 5 => 32 levels/channel (32^3 = 32768)
+        private const int LUT_SIZE = 1 << LUT_BITS;
+        private const int LUT_MASK = LUT_SIZE - 1;
+
+        // ---------- Overlay / desktop ----------
+        private WriteableBitmap? _overlay;
+        private int _vsLeft, _vsTop, _vsW, _vsH;
 
         private readonly DispatcherTimer _timer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(100) // ~10 FPS
+            Interval = TimeSpan.FromMilliseconds(TIMER_MS)
         };
 
-        private WriteableBitmap? _overlay;
-        private byte[]? _mask; // BGRA buffer (WPF PixelFormats.Bgra32)
-        private int _w, _h, _stride;
-        private int _left, _top;
+        // Cache per Excel window (buffer reuse)
+        private readonly Dictionary<IntPtr, CaptureCache> _cache = new();
+
+        // Last seen windows for "clear stale regions"
+        private List<ExcelWin> _lastWins = new();
+
+        // Precomputed quantized RGB -> BGRA output (alpha=0 means transparent)
+        // Stored as 4 bytes per entry (BGRA) for fast writes
+        private readonly byte[] _lutBGRA = new byte[LUT_SIZE * LUT_SIZE * LUT_SIZE * 4];
 
         public MainWindow()
         {
             InitializeComponent();
+            BuildLut();
             _timer.Tick += (_, __) => Tick();
         }
 
         private void Window_Loaded(object sender, RoutedEventArgs e)
         {
             // Full virtual desktop (all monitors)
-            _left = (int)SystemParameters.VirtualScreenLeft;
-            _top = (int)SystemParameters.VirtualScreenTop;
-            _w = (int)SystemParameters.VirtualScreenWidth;
-            _h = (int)SystemParameters.VirtualScreenHeight;
+            _vsLeft = (int)SystemParameters.VirtualScreenLeft;
+            _vsTop = (int)SystemParameters.VirtualScreenTop;
+            _vsW = (int)SystemParameters.VirtualScreenWidth;
+            _vsH = (int)SystemParameters.VirtualScreenHeight;
 
-            Left = _left;
-            Top = _top;
-            Width = _w;
-            Height = _h;
+            Left = _vsLeft;
+            Top = _vsTop;
+            Width = _vsW;
+            Height = _vsH;
 
-            _stride = _w * 4; // BGRA32
-            _mask = new byte[_stride * _h];
-
-            _overlay = new WriteableBitmap(_w, _h, 96, 96, System.Windows.Media.PixelFormats.Bgra32, null);
+            _overlay = new WriteableBitmap(_vsW, _vsH, 96, 96, System.Windows.Media.PixelFormats.Bgra32, null);
             OverlayImage.Source = _overlay;
 
             _timer.Start();
         }
-
-        private void Tick()
-        {
-            if (_overlay == null) return;
-
-            var excelRects = GetExcelClientRects();
-
-            // If Excel isn't present, clear once and bail.
-            if (excelRects.Count == 0)
-            {
-                if (_lastExcelRects.Count != 0)
-                {
-                    ClearOverlay();
-                    _lastExcelRects.Clear();
-                }
-                return;
-            }
-
-            // If the Excel window moved/resized, clear the old painted areas (simple + correct).
-            if (!SameRects(_lastExcelRects, excelRects))
-            {
-                ClearOverlay();
-                _lastExcelRects = excelRects;
-            }
-
-            foreach (var rc in excelRects)
-            {
-                // Clip to virtual screen
-                int capLeft = Math.Max(rc.Left, _left);
-                int capTop = Math.Max(rc.Top, _top);
-                int capRight = Math.Min(rc.Right, _left + _w);
-                int capBottom = Math.Min(rc.Bottom, _top + _h);
-
-                int capW = capRight - capLeft;
-                int capH = capBottom - capTop;
-                if (capW <= 0 || capH <= 0) continue;
-
-                // Capture only this Excel client region
-                using var bmp = new Bitmap(capW, capH, PixelFormat.Format32bppArgb);
-                using (var g = Graphics.FromImage(bmp))
-                {
-                    g.CopyFromScreen(capLeft, capTop, 0, 0, new System.Drawing.Size(capW, capH), CopyPixelOperation.SourceCopy);
-                }
-
-                // Read pixels
-                var data = bmp.LockBits(new System.Drawing.Rectangle(0, 0, capW, capH),
-                                        ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-
-                byte[] src;
-                int srcStride;
-                try
-                {
-                    srcStride = data.Stride;
-                    src = new byte[srcStride * capH];
-                    Marshal.Copy(data.Scan0, src, 0, src.Length);
-                }
-                finally
-                {
-                    bmp.UnlockBits(data);
-                }
-
-                // Build mask for this region only
-                int localStride = capW * 4;
-                byte[] localMask = new byte[localStride * capH];
-
-                for (int y = 0; y < capH; y++)
-                {
-                    int srcRow = y * srcStride;
-                    int dstRow = y * localStride;
-
-                    for (int x = 0; x < capW; x++)
-                    {
-                        int si = srcRow + x * 4;
-                        byte b = src[si + 0];
-                        byte g2 = src[si + 1];
-                        byte r = src[si + 2];
-
-                        RgbToHsv(r, g2, b, out float h, out float s, out float v);
-                        bool match = MatchesAnyTarget(h, s, v);
-
-                        int di = dstRow + x * 4;
-
-                        if (match)
-                        {
-                            HsvToRgb(PURPLE_HUE_DEG, s, v, out byte rr, out byte gg, out byte bb);
-                            localMask[di + 0] = bb;
-                            localMask[di + 1] = gg;
-                            localMask[di + 2] = rr;
-                            localMask[di + 3] = 255;
-                        }
-                        else
-                        {
-                            localMask[di + 3] = 0; // transparent
-                        }
-                    }
-                }
-
-                // Write this rect into the full-screen overlay at the correct offset
-                int destX = capLeft - _left;
-                int destY = capTop - _top;
-
-                _overlay.WritePixels(new Int32Rect(destX, destY, capW, capH), localMask, localStride, 0);
-            }
-        }
-
 
         // ---- Click-through / no-activate / don't-capture-self ----
         protected override void OnSourceInitialized(EventArgs e)
@@ -163,7 +70,6 @@ namespace ScreenColourReplacer
 
             var hwnd = new WindowInteropHelper(this).Handle;
             var exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-
             exStyle = new IntPtr(exStyle.ToInt64() | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
             SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle);
 
@@ -171,38 +77,237 @@ namespace ScreenColourReplacer
             SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
         }
 
-        private const int GWL_EXSTYLE = -20;
-        private const long WS_EX_TRANSPARENT = 0x20;
-        private const long WS_EX_LAYERED = 0x80000;
-        private const long WS_EX_NOACTIVATE = 0x08000000;
-        private const long WS_EX_TOOLWINDOW = 0x00000080;
+        private void Tick()
+        {
+            if (_overlay == null) return;
 
-        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr", SetLastError = true)]
-        private static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+            var wins = GetExcelWindows();
 
-        [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr", SetLastError = true)]
-        private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+            // No Excel => clear any previously drawn regions and stop doing work.
+            if (wins.Count == 0)
+            {
+                if (_lastWins.Count != 0)
+                {
+                    ClearStaleRegions(_lastWins);
+                    _lastWins.Clear();
+                }
+                return;
+            }
 
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint dwAffinity);
+            // Clear regions from windows that moved/closed (only those regions, not full screen)
+            ClearChangedOrClosedRegions(_lastWins, wins);
+            _lastWins = wins;
 
-        private const uint WDA_EXCLUDEFROMCAPTURE = 0x11;
+            // Capture + process each Excel window region
+            foreach (var w in wins)
+            {
+                // Clip to virtual screen
+                if (!ClipToVirtualScreen(w.Rect, out var cap)) continue;
 
-        // ---- Hue matching config ----
-        // Replace these two green-ish hue families with a purple hue.
-        // #60BD82 hue ≈ 141.94°, #9FC7B1 hue ≈ 147.00°
-        private const float PURPLE_HUE_DEG = 285f; // 270–300 looks "purple"
+                int capW = cap.Width;
+                int capH = cap.Height;
 
-        private const float MIN_V = 0.08f; // ignore near-black pixels (optional)
+                // Get/reuse cache for this hwnd and size
+                if (!_cache.TryGetValue(w.Hwnd, out var cc) || cc.Width != capW || cc.Height != capH)
+                {
+                    cc?.Dispose();
+                    cc = new CaptureCache(capW, capH);
+                    _cache[w.Hwnd] = cc;
+                }
 
+                // Capture cap region into cc.SrcBytes (BGRA32)
+                cc.CaptureScreenRegion(cap.Left, cap.Top);
+
+                // Build mask in cc.MaskBytes using LUT (BGRA32)
+                ApplyLut(cc.SrcBytes, cc.SrcStride, cc.MaskBytes, cc.MaskStride, capW, capH);
+
+                // Write to overlay at correct offset
+                int destX = cap.Left - _vsLeft;
+                int destY = cap.Top - _vsTop;
+                _overlay.WritePixels(new Int32Rect(destX, destY, capW, capH), cc.MaskBytes, cc.MaskStride, 0);
+            }
+
+            // Optional: clean caches for Excel windows that closed
+            CleanupCacheForClosedWindows(wins);
+        }
+
+        // ---------- Region clipping ----------
+        private bool ClipToVirtualScreen(RECT r, out RECT cap)
+        {
+            int left = Math.Max(r.Left, _vsLeft);
+            int top = Math.Max(r.Top, _vsTop);
+            int right = Math.Min(r.Right, _vsLeft + _vsW);
+            int bottom = Math.Min(r.Bottom, _vsTop + _vsH);
+
+            cap = new RECT { Left = left, Top = top, Right = right, Bottom = bottom };
+            return cap.Width > 0 && cap.Height > 0;
+        }
+
+        // ---------- Clear only stale areas ----------
+        private void ClearChangedOrClosedRegions(List<ExcelWin> oldWins, List<ExcelWin> newWins)
+        {
+            if (_overlay == null) return;
+
+            // Build a lookup of new rects by hwnd
+            var newByHwnd = new Dictionary<IntPtr, RECT>(newWins.Count);
+            foreach (var nw in newWins) newByHwnd[nw.Hwnd] = nw.Rect;
+
+            foreach (var ow in oldWins)
+            {
+                if (!newByHwnd.TryGetValue(ow.Hwnd, out var nr) || !RectsEqual(ow.Rect, nr))
+                {
+                    // window closed or moved/resized => clear old region
+                    if (ClipToVirtualScreen(ow.Rect, out var capOld))
+                        WriteTransparentRect(capOld);
+                }
+            }
+        }
+
+        private void ClearStaleRegions(List<ExcelWin> oldWins)
+        {
+            foreach (var ow in oldWins)
+            {
+                if (ClipToVirtualScreen(ow.Rect, out var capOld))
+                    WriteTransparentRect(capOld);
+            }
+        }
+
+        private void WriteTransparentRect(RECT cap)
+        {
+            if (_overlay == null) return;
+            int w = cap.Width;
+            int h = cap.Height;
+            if (w <= 0 || h <= 0) return;
+
+            // reuse a small clear buffer keyed by size (simple local static cache)
+            var key = (w, h);
+            if (!ClearBufferCache.TryGetValue(key, out var buf))
+            {
+                buf = new byte[w * h * 4]; // zero = transparent
+                ClearBufferCache[key] = buf;
+            }
+            // buf is already all zeros; no need to clear each time
+
+            int destX = cap.Left - _vsLeft;
+            int destY = cap.Top - _vsTop;
+            _overlay.WritePixels(new Int32Rect(destX, destY, w, h), buf, w * 4, 0);
+        }
+
+        private static readonly Dictionary<(int W, int H), byte[]> ClearBufferCache = new();
+
+        private static bool RectsEqual(RECT a, RECT b) =>
+            a.Left == b.Left && a.Top == b.Top && a.Right == b.Right && a.Bottom == b.Bottom;
+
+        private void CleanupCacheForClosedWindows(List<ExcelWin> wins)
+        {
+            // Remove caches for hwnds not present anymore
+            var alive = new HashSet<IntPtr>();
+            foreach (var w in wins) alive.Add(w.Hwnd);
+
+            // Collect to delete (avoid modifying dictionary while iterating)
+            List<IntPtr>? toDelete = null;
+            foreach (var kv in _cache)
+            {
+                if (!alive.Contains(kv.Key))
+                {
+                    toDelete ??= new List<IntPtr>();
+                    toDelete.Add(kv.Key);
+                }
+            }
+            if (toDelete == null) return;
+
+            foreach (var h in toDelete)
+            {
+                _cache[h].Dispose();
+                _cache.Remove(h);
+            }
+        }
+
+        // ---------- LUT application ----------
+        private void ApplyLut(byte[] srcBGRA, int srcStride, byte[] dstBGRA, int dstStride, int w, int h)
+        {
+            // Fast rejects: if your targets are mostly green-ish, early reject lots of pixels cheaply:
+            // (kept simple here; LUT already cheap)
+            for (int y = 0; y < h; y++)
+            {
+                int sRow = y * srcStride;
+                int dRow = y * dstStride;
+
+                for (int x = 0; x < w; x++)
+                {
+                    int si = sRow + x * 4;
+                    byte b = srcBGRA[si + 0];
+                    byte g = srcBGRA[si + 1];
+                    byte r = srcBGRA[si + 2];
+
+                    // Quantize to 5-bit bins
+                    int rQ = r >> (8 - LUT_BITS);
+                    int gQ = g >> (8 - LUT_BITS);
+                    int bQ = b >> (8 - LUT_BITS);
+
+                    int idx = (((rQ & LUT_MASK) * LUT_SIZE + (gQ & LUT_MASK)) * LUT_SIZE + (bQ & LUT_MASK)) * 4;
+
+                    int di = dRow + x * 4;
+                    dstBGRA[di + 0] = _lutBGRA[idx + 0];
+                    dstBGRA[di + 1] = _lutBGRA[idx + 1];
+                    dstBGRA[di + 2] = _lutBGRA[idx + 2];
+                    dstBGRA[di + 3] = _lutBGRA[idx + 3];
+                }
+            }
+        }
+
+        private void BuildLut()
+        {
+            // Precompute mapping for each quantized RGB.
+            // For each bin, we pick the bin center value to compute HSV + match targets.
+            for (int rQ = 0; rQ < LUT_SIZE; rQ++)
+            {
+                byte r = (byte)((rQ * 255 + (LUT_SIZE - 1) / 2) / (LUT_SIZE - 1));
+                for (int gQ = 0; gQ < LUT_SIZE; gQ++)
+                {
+                    byte g = (byte)((gQ * 255 + (LUT_SIZE - 1) / 2) / (LUT_SIZE - 1));
+                    for (int bQ = 0; bQ < LUT_SIZE; bQ++)
+                    {
+                        byte b = (byte)((bQ * 255 + (LUT_SIZE - 1) / 2) / (LUT_SIZE - 1));
+
+                        RgbToHsv(r, g, b, out float h, out float s, out float v);
+                        bool match = MatchesAnyTarget(h, s, v);
+
+                        int idx = (((rQ * LUT_SIZE + gQ) * LUT_SIZE + bQ) * 4);
+
+                        if (match)
+                        {
+                            HsvToRgb(PURPLE_HUE_DEG, s, v, out byte rr, out byte gg, out byte bb);
+                            _lutBGRA[idx + 0] = bb;
+                            _lutBGRA[idx + 1] = gg;
+                            _lutBGRA[idx + 2] = rr;
+                            _lutBGRA[idx + 3] = 255;
+                        }
+                        else
+                        {
+                            _lutBGRA[idx + 0] = 0;
+                            _lutBGRA[idx + 1] = 0;
+                            _lutBGRA[idx + 2] = 0;
+                            _lutBGRA[idx + 3] = 0; // transparent
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------- Hue matching config (your targets) ----------
+        private const float PURPLE_HUE_DEG = 285f;
+        private const float MIN_V = 0.08f;
+
+        // (HueDeg, TolDeg, MinS)
         private static readonly (float HueDeg, float TolDeg, float MinS)[] TARGETS =
         {
-            (141.94f, 12f, 0.18f), // #60BD82-ish (more saturated)
-            (147.00f, 12f, 0.10f), // #9FC7B1-ish (pastel / lower saturation)
-            (148.42f, 12f, 0.04f),
-            (124.86f, 12f, 0.18f),
-            (76.47f, 12f, 0.18f),
-            (110.77f, 12f, 0.18f),
+            (141.94f, 12f, 0.18f), // #60BD82-ish
+            (147.00f, 12f, 0.10f), // #9FC7B1-ish
+            (148.42f, 12f, 0.04f), // #CFE2D8-ish
+            (124.86f, 12f, 0.18f), // #1E6824-ish
+            (76.47f, 12f, 0.18f),  // #BEDA74-ish
+            (110.77f, 12f, 0.18f), // #72D560-ish
         };
 
         private static bool MatchesAnyTarget(float hDeg, float s, float v)
@@ -259,7 +364,7 @@ namespace ScreenColourReplacer
                 return;
             }
 
-            float h = (hDeg % 360f) / 60f; // 0..6
+            float h = (hDeg % 360f) / 60f;
             int i = (int)MathF.Floor(h);
             float f = h - i;
 
@@ -275,7 +380,7 @@ namespace ScreenColourReplacer
                 case 2: r = p; g = v; b = t; break;
                 case 3: r = p; g = q; b = v; break;
                 case 4: r = t; g = p; b = v; break;
-                default: r = v; g = p; b = q; break; // case 5
+                default: r = v; g = p; b = q; break;
             }
 
             r8 = (byte)Math.Clamp((int)MathF.Round(r * 255f), 0, 255);
@@ -283,7 +388,15 @@ namespace ScreenColourReplacer
             b8 = (byte)Math.Clamp((int)MathF.Round(b * 255f), 0, 255);
         }
 
+        // ---------- Excel window enumeration ----------
         private const string EXCEL_CLASS = "XLMAIN";
+
+        public readonly struct ExcelWin
+        {
+            public ExcelWin(IntPtr hwnd, RECT rect) { Hwnd = hwnd; Rect = rect; }
+            public IntPtr Hwnd { get; }
+            public RECT Rect { get; }
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT
@@ -299,27 +412,26 @@ namespace ScreenColourReplacer
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
         [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
         [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
 
         [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
         [DllImport("user32.dll")] private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
 
-        private static System.Collections.Generic.List<RECT> GetExcelClientRects()
+        private static List<ExcelWin> GetExcelWindows()
         {
-            var rects = new System.Collections.Generic.List<RECT>();
+            var wins = new List<ExcelWin>(4);
 
             EnumWindows((hWnd, _) =>
             {
                 if (!IsWindowVisible(hWnd) || IsIconic(hWnd)) return true;
 
-                var sb = new System.Text.StringBuilder(256);
+                var sb = new StringBuilder(256);
                 GetClassName(hWnd, sb, sb.Capacity);
                 if (!string.Equals(sb.ToString(), EXCEL_CLASS, StringComparison.Ordinal))
                     return true;
 
-                // client rect -> screen coords
                 if (!GetClientRect(hWnd, out var rcClient)) return true;
                 if (rcClient.Width <= 0 || rcClient.Height <= 0) return true;
 
@@ -328,30 +440,152 @@ namespace ScreenColourReplacer
                 ClientToScreen(hWnd, ref tl);
                 ClientToScreen(hWnd, ref br);
 
-                rects.Add(new RECT { Left = tl.X, Top = tl.Y, Right = br.X, Bottom = br.Y });
+                var screenRect = new RECT { Left = tl.X, Top = tl.Y, Right = br.X, Bottom = br.Y };
+                wins.Add(new ExcelWin(hWnd, screenRect));
                 return true;
             }, IntPtr.Zero);
 
-            return rects;
+            return wins;
         }
 
-        private static bool SameRects(System.Collections.Generic.List<RECT> a, System.Collections.Generic.List<RECT> b)
+        // ---------- High-performance capture cache (BitBlt -> DIB section) ----------
+        private sealed class CaptureCache : IDisposable
         {
-            if (a.Count != b.Count) return false;
-            for (int i = 0; i < a.Count; i++)
+            public int Width { get; }
+            public int Height { get; }
+            public int SrcStride { get; }
+            public int MaskStride { get; }
+
+            public byte[] SrcBytes { get; }
+            public byte[] MaskBytes { get; }
+
+            private readonly IntPtr _memDc;
+            private readonly IntPtr _hBmp;
+            private readonly IntPtr _oldObj;
+            private readonly IntPtr _bitsPtr;
+
+            public CaptureCache(int w, int h)
             {
-                if (a[i].Left != b[i].Left || a[i].Top != b[i].Top || a[i].Right != b[i].Right || a[i].Bottom != b[i].Bottom)
-                    return false;
+                Width = w;
+                Height = h;
+                SrcStride = w * 4;
+                MaskStride = w * 4;
+
+                SrcBytes = new byte[SrcStride * h];
+                MaskBytes = new byte[MaskStride * h];
+
+                _memDc = CreateCompatibleDC(IntPtr.Zero);
+
+                // Create top-down 32bpp DIB section
+                BITMAPINFO bmi = new BITMAPINFO
+                {
+                    biSize = (uint)Marshal.SizeOf<BITMAPINFO>(),
+                    biWidth = w,
+                    biHeight = -h, // negative => top-down
+                    biPlanes = 1,
+                    biBitCount = 32,
+                    biCompression = BI_RGB
+                };
+
+                _hBmp = CreateDIBSection(_memDc, ref bmi, DIB_RGB_COLORS, out _bitsPtr, IntPtr.Zero, 0);
+                if (_hBmp == IntPtr.Zero) throw new Exception("CreateDIBSection failed.");
+
+                _oldObj = SelectObject(_memDc, _hBmp);
             }
-            return true;
+
+            public void CaptureScreenRegion(int screenX, int screenY)
+            {
+                IntPtr screenDc = GetDC(IntPtr.Zero);
+                try
+                {
+                    // Copy screen into our DIB section
+                    BitBlt(_memDc, 0, 0, Width, Height, screenDc, screenX, screenY, SRCCOPY);
+                }
+                finally
+                {
+                    ReleaseDC(IntPtr.Zero, screenDc);
+                }
+
+                // Copy DIB pixels into managed SrcBytes (single Marshal.Copy; no LockBits/Bitmap)
+                Marshal.Copy(_bitsPtr, SrcBytes, 0, SrcBytes.Length);
+            }
+
+            public void Dispose()
+            {
+                if (_oldObj != IntPtr.Zero) SelectObject(_memDc, _oldObj);
+                if (_hBmp != IntPtr.Zero) DeleteObject(_hBmp);
+                if (_memDc != IntPtr.Zero) DeleteDC(_memDc);
+            }
         }
 
-        private void ClearOverlay()
+        // ---------- P/Invokes for capture ----------
+        private const int SRCCOPY = 0x00CC0020;
+        private const uint BI_RGB = 0;
+        private const uint DIB_RGB_COLORS = 0;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BITMAPINFO
         {
-            if (_overlay == null || _mask == null) return;
-            Array.Clear(_mask, 0, _mask.Length);
-            _overlay.WritePixels(new Int32Rect(0, 0, _w, _h), _mask, _stride, 0);
+            public uint biSize;
+            public int biWidth;
+            public int biHeight;
+            public ushort biPlanes;
+            public ushort biBitCount;
+            public uint biCompression;
+            public uint biSizeImage;
+            public int biXPelsPerMeter;
+            public int biYPelsPerMeter;
+            public uint biClrUsed;
+            public uint biClrImportant;
         }
 
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern bool DeleteDC(IntPtr hdc);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern IntPtr SelectObject(IntPtr hdc, IntPtr h);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern bool DeleteObject(IntPtr hObject);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern bool BitBlt(IntPtr hdcDest, int xDest, int yDest, int wDest, int hDest,
+                                         IntPtr hdcSrc, int xSrc, int ySrc, int rop);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern IntPtr CreateDIBSection(
+            IntPtr hdc,
+            [In] ref BITMAPINFO pbmi,
+            uint iUsage,
+            out IntPtr ppvBits,
+            IntPtr hSection,
+            uint dwOffset);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetDC(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+        // ---------- P/Invokes for window styles / capture affinity ----------
+        private const int GWL_EXSTYLE = -20;
+        private const long WS_EX_TRANSPARENT = 0x20;
+        private const long WS_EX_LAYERED = 0x80000;
+        private const long WS_EX_NOACTIVATE = 0x08000000;
+        private const long WS_EX_TOOLWINDOW = 0x00000080;
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr", SetLastError = true)]
+        private static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr", SetLastError = true)]
+        private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint dwAffinity);
+
+        private const uint WDA_EXCLUDEFROMCAPTURE = 0x11;
     }
 }
