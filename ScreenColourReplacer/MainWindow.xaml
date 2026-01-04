@@ -10,8 +10,9 @@
         Loaded="Window_Loaded">
     <Grid>
         <Image x:Name="OverlayImage"
-               Stretch="Fill"
+               Stretch="None"
                SnapsToDevicePixels="True"
+               UseLayoutRounding="True"
                RenderOptions.BitmapScalingMode="NearestNeighbor"/>
     </Grid>
 </Window>

@@ -1,7 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Drawing;
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows;
 using System.Windows.Interop;
@@ -11,6 +8,8 @@ using System.Buffers.Binary;
 using System.IO.Hashing;
 using System.Runtime.CompilerServices;
 using System.IO;
+using System.Windows.Media;
+
 
 
 namespace ScreenColourReplacer
@@ -66,22 +65,37 @@ namespace ScreenColourReplacer
 
         private void Window_Loaded(object sender, RoutedEventArgs e)
         {
-            // Full virtual desktop (all monitors)
-            _vsLeft = (int)SystemParameters.VirtualScreenLeft;
-            _vsTop = (int)SystemParameters.VirtualScreenTop;
-            _vsW = (int)SystemParameters.VirtualScreenWidth;
-            _vsH = (int)SystemParameters.VirtualScreenHeight;
+            // Virtual desktop in *physical pixels*
+            int vsLeftPx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            int vsTopPx = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            int vsWPx = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            int vsHPx = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
-            Left = _vsLeft;
-            Top = _vsTop;
-            Width = _vsW;
-            Height = _vsH;
+            // Store as pixel coords (used for your dstX/dstY math)
+            _vsLeft = vsLeftPx;
+            _vsTop = vsTopPx;
+            _vsW = vsWPx;
+            _vsH = vsHPx;
 
-            _overlay = new WriteableBitmap(_vsW, _vsH, 96, 96, System.Windows.Media.PixelFormats.Bgra32, null);
+            // Convert pixels -> DIPs for *WPF window placement*
+            var dpi = VisualTreeHelper.GetDpi(this);
+            double sx = dpi.DpiScaleX;
+            double sy = dpi.DpiScaleY;
+
+            Left = vsLeftPx / sx;
+            Top = vsTopPx / sy;
+            Width = vsWPx / sx;
+            Height = vsHPx / sy;
+
+            // Create bitmap in *pixel dimensions*, but set DPI to match monitor scale
+            _overlay = new WriteableBitmap(vsWPx, vsHPx, dpi.PixelsPerInchX, dpi.PixelsPerInchY,
+                                           System.Windows.Media.PixelFormats.Bgra32, null);
+
             OverlayImage.Source = _overlay;
 
             _timer.Start();
         }
+
 
         private unsafe ulong ComputeSignatureFull(IntPtr bits, int stride, int w, int h)
         {
@@ -870,6 +884,14 @@ namespace ScreenColourReplacer
         private static extern bool QueryFullProcessImageName(IntPtr hProcess, int dwFlags, StringBuilder lpExeName, ref int lpdwSize);
 
         private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+        [DllImport("user32.dll")]
+        private static extern int GetSystemMetrics(int nIndex);
+
+        private const int SM_XVIRTUALSCREEN = 76;
+        private const int SM_YVIRTUALSCREEN = 77;
+        private const int SM_CXVIRTUALSCREEN = 78;
+        private const int SM_CYVIRTUALSCREEN = 79;
 
         private static bool Intersect(in RECT a, in RECT b, out RECT r)
         {
