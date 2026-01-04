@@ -266,7 +266,7 @@ namespace ScreenColourReplacer
                     bool visChanged = !cc.HasLastVisSig || visSig != cc.LastVisSig;
 
                     // Capture pixels (always needed before draw; needed before sampling)
-                    cc.CaptureExcelClientOrFallback(w.Hwnd, screenDc, w.Rect.Left, w.Rect.Top);
+                    cc.CaptureVisibleRects(screenDc, w.Rect, visibles);
 
                     bool contentChanged;
                     if (visChanged)
@@ -333,6 +333,7 @@ namespace ScreenColourReplacer
 
             CleanupCacheForClosedWindows(wins);
         }
+
 
         private static RECT UnionAll(IReadOnlyList<ExcelWin> wins)
         {
@@ -929,6 +930,25 @@ namespace ScreenColourReplacer
                 _oldObj = SelectObject(_memDc, _hBmp);
             }
 
+            // in CaptureCache
+            public void CaptureVisibleRects(IntPtr screenDc, in RECT excelRect, List<RECT> visibles)
+            {
+                for (int i = 0; i < visibles.Count; i++)
+                {
+                    var cap = visibles[i];
+
+                    int w = cap.Width, h = cap.Height;
+                    if (w <= 0 || h <= 0) continue;
+
+                    // Destination in the DIB (Excel-local coords)
+                    int dstX = cap.Left - excelRect.Left;
+                    int dstY = cap.Top - excelRect.Top;
+
+                    // Source on screen (screen coords)
+                    BitBlt(_memDc, dstX, dstY, w, h, screenDc, cap.Left, cap.Top, SRCCOPY);
+                }
+            }
+
             public bool CaptureExcelClient(IntPtr hwnd)
             {
                 // Capture the client area (Excel grid) into our DIB.
@@ -1137,6 +1157,7 @@ namespace ScreenColourReplacer
 
             return cur; // IMPORTANT: this is either 'a' or 'b'
         }
+
 
 
     }
