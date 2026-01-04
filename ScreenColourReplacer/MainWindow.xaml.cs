@@ -47,9 +47,7 @@ namespace ScreenColourReplacer
         // Last seen windows for "clear stale regions"
         private List<ExcelWin> _lastWins = new();
 
-        // Precomputed quantized RGB -> BGRA output (alpha=0 means transparent)
-        // Stored as 4 bytes per entry (BGRA) for fast writes
-        private readonly byte[] _lutBGRA = new byte[LUT_SIZE * LUT_SIZE * LUT_SIZE * 4];
+        private readonly uint[] _lut32 = new uint[LUT_SIZE * LUT_SIZE * LUT_SIZE]; // packed BGRA in little-endian
 
         public MainWindow()
         {
@@ -97,7 +95,6 @@ namespace ScreenColourReplacer
 
             var wins = GetExcelWindows();
 
-            // No Excel => clear any previously drawn regions and stop doing work.
             if (wins.Count == 0)
             {
                 if (_lastWins.Count != 0)
@@ -108,50 +105,70 @@ namespace ScreenColourReplacer
                 return;
             }
 
-            // Clear regions from windows that moved/closed (only those regions, not full screen)
+            // Keep your existing stale-clear logic BEFORE Lock() (because it uses WritePixels)
             ClearChangedOrClosedRegions(_lastWins, wins);
             _lastWins = wins;
 
-            // Capture + process each Excel window region
-            foreach (var w in wins)
+            // ---- Lock overlay once ----
+            _overlay.Lock();
+            try
             {
-                // Clip to virtual screen
-                var visibles = GetVisibleExcelRects(w.Hwnd, w.Rect);
+                IntPtr dstBackBuffer = _overlay.BackBuffer;
+                int dstStride = _overlay.BackBufferStride;
 
-                foreach (var vr in visibles)
+                // Optional but recommended: get screen DC once per tick
+                IntPtr screenDc = GetDC(IntPtr.Zero);
+                try
                 {
-                    // Clip to virtual screen
-                    if (!ClipToVirtualScreen(vr, out var cap)) continue;
-
-                    int capW = cap.Width;
-                    int capH = cap.Height;
-
-                    // Get/reuse cache for this hwnd and size
-                    var key = new CacheKey(w.Hwnd, capW, capH);
-
-                    if (!_cache.TryGetValue(key, out var cc))
+                    foreach (var w in wins)
                     {
-                        cc = new CaptureCache(capW, capH);
-                        _cache[key] = cc;
+                        var visibles = GetVisibleExcelRects(w.Hwnd, w.Rect);
+
+                        foreach (var vr in visibles)
+                        {
+                            if (!ClipToVirtualScreen(vr, out var cap)) continue;
+
+                            int capW = cap.Width;
+                            int capH = cap.Height;
+
+                            var key = new CacheKey(w.Hwnd, capW, capH);
+                            if (!_cache.TryGetValue(key, out var cc))
+                            {
+                                cc = new CaptureCache(capW, capH);
+                                _cache[key] = cc;
+                            }
+
+                            // Capture visible region directly into DIB section bits
+                            cc.CaptureScreenRegion(screenDc, cap.Left, cap.Top);
+
+                            int destX = cap.Left - _vsLeft;
+                            int destY = cap.Top - _vsTop;
+
+                            // Apply LUT directly into overlay backbuffer
+                            ApplyLutToBackBuffer(
+                                cc.BitsPtr, cc.SrcStride,
+                                dstBackBuffer, dstStride,
+                                destX, destY,
+                                capW, capH);
+
+                            // Mark dirty region
+                            _overlay.AddDirtyRect(new Int32Rect(destX, destY, capW, capH));
+                        }
                     }
-
-                    // Capture visible region
-                    cc.CaptureScreenRegion(cap.Left, cap.Top);
-
-                    // Apply LUT
-                    ApplyLut(cc.SrcBytes, cc.SrcStride, cc.MaskBytes, cc.MaskStride, capW, capH);
-
-                    // Write to overlay at correct offset
-                    int destX = cap.Left - _vsLeft;
-                    int destY = cap.Top - _vsTop;
-                    _overlay.WritePixels(new Int32Rect(destX, destY, capW, capH), cc.MaskBytes, cc.MaskStride, 0);
                 }
-
+                finally
+                {
+                    ReleaseDC(IntPtr.Zero, screenDc);
+                }
+            }
+            finally
+            {
+                _overlay.Unlock();
             }
 
-            // Optional: clean caches for Excel windows that closed
             CleanupCacheForClosedWindows(wins);
         }
+
 
         // ---------- Region clipping ----------
         private bool ClipToVirtualScreen(RECT r, out RECT cap)
@@ -249,37 +266,41 @@ namespace ScreenColourReplacer
 
 
         // ---------- LUT application ----------
-        private void ApplyLut(byte[] srcBGRA, int srcStride, byte[] dstBGRA, int dstStride, int w, int h)
+        private unsafe void ApplyLutToBackBuffer(
+            IntPtr srcBits, int srcStride,
+            IntPtr dstBackBuffer, int dstStride,
+            int dstX, int dstY,
+            int w, int h)
         {
-            // Fast rejects: if your targets are mostly green-ish, early reject lots of pixels cheaply:
-            // (kept simple here; LUT already cheap)
+            byte* srcBase = (byte*)srcBits.ToPointer();
+            byte* dstBase = (byte*)dstBackBuffer.ToPointer();
+
             for (int y = 0; y < h; y++)
             {
-                int sRow = y * srcStride;
-                int dRow = y * dstStride;
+                byte* sRow = srcBase + y * srcStride;
+
+                // Destination row start in the full-screen overlay backbuffer
+                byte* dRowBytes = dstBase + (dstY + y) * dstStride + dstX * 4;
+                uint* dRow = (uint*)dRowBytes;
 
                 for (int x = 0; x < w; x++)
                 {
-                    int si = sRow + x * 4;
-                    byte b = srcBGRA[si + 0];
-                    byte g = srcBGRA[si + 1];
-                    byte r = srcBGRA[si + 2];
+                    int si = x * 4;
+                    byte b = sRow[si + 0];
+                    byte g = sRow[si + 1];
+                    byte r = sRow[si + 2];
 
-                    // Quantize to 5-bit bins
                     int rQ = r >> (8 - LUT_BITS);
                     int gQ = g >> (8 - LUT_BITS);
                     int bQ = b >> (8 - LUT_BITS);
 
-                    int idx = (((rQ & LUT_MASK) * LUT_SIZE + (gQ & LUT_MASK)) * LUT_SIZE + (bQ & LUT_MASK)) * 4;
+                    int idx = ((rQ * LUT_SIZE + gQ) * LUT_SIZE + bQ);
 
-                    int di = dRow + x * 4;
-                    dstBGRA[di + 0] = _lutBGRA[idx + 0];
-                    dstBGRA[di + 1] = _lutBGRA[idx + 1];
-                    dstBGRA[di + 2] = _lutBGRA[idx + 2];
-                    dstBGRA[di + 3] = _lutBGRA[idx + 3];
+                    dRow[x] = _lut32[idx]; // single 32-bit store
                 }
             }
         }
+
 
         private void BuildLut()
         {
@@ -298,23 +319,21 @@ namespace ScreenColourReplacer
                         RgbToHsv(r, g, b, out float h, out float s, out float v);
                         bool match = MatchesAnyTarget(h, s, v);
 
-                        int idx = (((rQ * LUT_SIZE + gQ) * LUT_SIZE + bQ) * 4);
+                        int idx = ((rQ * LUT_SIZE + gQ) * LUT_SIZE + bQ);
 
                         if (match)
                         {
                             HsvToRgb(PURPLE_HUE_DEG, s, v, out byte rr, out byte gg, out byte bb);
-                            _lutBGRA[idx + 0] = bb;
-                            _lutBGRA[idx + 1] = gg;
-                            _lutBGRA[idx + 2] = rr;
-                            _lutBGRA[idx + 3] = 255;
+
+                            // WriteableBitmap is BGRA in memory.
+                            // Pack as 0xAARRGGBB so little-endian bytes are BB GG RR AA.
+                            _lut32[idx] = (uint)(bb | (gg << 8) | (rr << 16) | (255u << 24));
                         }
                         else
                         {
-                            _lutBGRA[idx + 0] = 0;
-                            _lutBGRA[idx + 1] = 0;
-                            _lutBGRA[idx + 2] = 0;
-                            _lutBGRA[idx + 3] = 0; // transparent
+                            _lut32[idx] = 0u; // transparent
                         }
+
                     }
                 }
             }
@@ -333,6 +352,7 @@ namespace ScreenColourReplacer
             (124.86f, 12f, 0.18f), // #1E6824-ish
             (76.47f, 12f, 0.18f),  // #BEDA74-ish
             (110.77f, 12f, 0.18f), // #72D560-ish
+            (147.22f, 12f, 0.18f), // #0F703B / #107C41-ish
         };
 
         private static bool MatchesAnyTarget(float hDeg, float s, float v)
@@ -478,11 +498,9 @@ namespace ScreenColourReplacer
         {
             public int Width { get; }
             public int Height { get; }
-            public int SrcStride { get; }
-            public int MaskStride { get; }
+            public int SrcStride { get; } // bytes per row in DIB (we create it as w*4)
 
-            public byte[] SrcBytes { get; }
-            public byte[] MaskBytes { get; }
+            public IntPtr BitsPtr => _bitsPtr;
 
             private readonly IntPtr _memDc;
             private readonly IntPtr _hBmp;
@@ -494,10 +512,6 @@ namespace ScreenColourReplacer
                 Width = w;
                 Height = h;
                 SrcStride = w * 4;
-                MaskStride = w * 4;
-
-                SrcBytes = new byte[SrcStride * h];
-                MaskBytes = new byte[MaskStride * h];
 
                 _memDc = CreateCompatibleDC(IntPtr.Zero);
 
@@ -518,21 +532,11 @@ namespace ScreenColourReplacer
                 _oldObj = SelectObject(_memDc, _hBmp);
             }
 
-            public void CaptureScreenRegion(int screenX, int screenY)
+            // IMPORTANT: this now needs a screenDc passed in (so Tick can Lock once and reuse DC)
+            public void CaptureScreenRegion(IntPtr screenDc, int screenX, int screenY)
             {
-                IntPtr screenDc = GetDC(IntPtr.Zero);
-                try
-                {
-                    // Copy screen into our DIB section
-                    BitBlt(_memDc, 0, 0, Width, Height, screenDc, screenX, screenY, SRCCOPY);
-                }
-                finally
-                {
-                    ReleaseDC(IntPtr.Zero, screenDc);
-                }
-
-                // Copy DIB pixels into managed SrcBytes (single Marshal.Copy; no LockBits/Bitmap)
-                Marshal.Copy(_bitsPtr, SrcBytes, 0, SrcBytes.Length);
+                BitBlt(_memDc, 0, 0, Width, Height, screenDc, screenX, screenY, SRCCOPY);
+                // No Marshal.Copy, pixels stay in _bitsPtr
             }
 
             public void Dispose()
@@ -542,6 +546,7 @@ namespace ScreenColourReplacer
                 if (_memDc != IntPtr.Zero) DeleteDC(_memDc);
             }
         }
+
 
         // ---------- P/Invokes for capture ----------
         private const int SRCCOPY = 0x00CC0020;
