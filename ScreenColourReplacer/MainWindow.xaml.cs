@@ -11,6 +11,8 @@ namespace ScreenColourReplacer
 {
     public partial class MainWindow : Window
     {
+        private System.Collections.Generic.List<RECT> _lastExcelRects = new();
+
         private readonly DispatcherTimer _timer = new DispatcherTimer
         {
             Interval = TimeSpan.FromMilliseconds(100) // ~10 FPS
@@ -51,74 +53,108 @@ namespace ScreenColourReplacer
 
         private void Tick()
         {
-            if (_overlay == null || _mask == null) return;
+            if (_overlay == null) return;
 
-            // 1) Capture screen into a 32bpp bitmap
-            using var bmp = new Bitmap(_w, _h, PixelFormat.Format32bppArgb);
-            using (var g = Graphics.FromImage(bmp))
+            var excelRects = GetExcelClientRects();
+
+            // If Excel isn't present, clear once and bail.
+            if (excelRects.Count == 0)
             {
-                g.CopyFromScreen(_left, _top, 0, 0, new System.Drawing.Size(_w, _h), CopyPixelOperation.SourceCopy);
+                if (_lastExcelRects.Count != 0)
+                {
+                    ClearOverlay();
+                    _lastExcelRects.Clear();
+                }
+                return;
             }
 
-            // 2) Read pixels and build the overlay mask (purple where hue matches targets, else transparent)
-            var rect = new System.Drawing.Rectangle(0, 0, _w, _h);
-            var data = bmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-
-            try
+            // If the Excel window moved/resized, clear the old painted areas (simple + correct).
+            if (!SameRects(_lastExcelRects, excelRects))
             {
-                int srcStride = data.Stride;
-                int srcBytes = srcStride * _h;
-                byte[] src = new byte[srcBytes];
-                Marshal.Copy(data.Scan0, src, 0, srcBytes);
+                ClearOverlay();
+                _lastExcelRects = excelRects;
+            }
 
-                for (int y = 0; y < _h; y++)
+            foreach (var rc in excelRects)
+            {
+                // Clip to virtual screen
+                int capLeft = Math.Max(rc.Left, _left);
+                int capTop = Math.Max(rc.Top, _top);
+                int capRight = Math.Min(rc.Right, _left + _w);
+                int capBottom = Math.Min(rc.Bottom, _top + _h);
+
+                int capW = capRight - capLeft;
+                int capH = capBottom - capTop;
+                if (capW <= 0 || capH <= 0) continue;
+
+                // Capture only this Excel client region
+                using var bmp = new Bitmap(capW, capH, PixelFormat.Format32bppArgb);
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.CopyFromScreen(capLeft, capTop, 0, 0, new System.Drawing.Size(capW, capH), CopyPixelOperation.SourceCopy);
+                }
+
+                // Read pixels
+                var data = bmp.LockBits(new System.Drawing.Rectangle(0, 0, capW, capH),
+                                        ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+
+                byte[] src;
+                int srcStride;
+                try
+                {
+                    srcStride = data.Stride;
+                    src = new byte[srcStride * capH];
+                    Marshal.Copy(data.Scan0, src, 0, src.Length);
+                }
+                finally
+                {
+                    bmp.UnlockBits(data);
+                }
+
+                // Build mask for this region only
+                int localStride = capW * 4;
+                byte[] localMask = new byte[localStride * capH];
+
+                for (int y = 0; y < capH; y++)
                 {
                     int srcRow = y * srcStride;
-                    int dstRow = y * _stride;
+                    int dstRow = y * localStride;
 
-                    for (int x = 0; x < _w; x++)
+                    for (int x = 0; x < capW; x++)
                     {
                         int si = srcRow + x * 4;
-
-                        // src is BGRA in memory on little-endian Windows
                         byte b = src[si + 0];
                         byte g2 = src[si + 1];
                         byte r = src[si + 2];
 
                         RgbToHsv(r, g2, b, out float h, out float s, out float v);
+                        bool match = MatchesAnyTarget(h, s, v);
 
                         int di = dstRow + x * 4;
 
-                        bool match = MatchesAnyTarget(h, s, v);
-
                         if (match)
                         {
-                            // Replace hue with purple, keep same saturation/value
                             HsvToRgb(PURPLE_HUE_DEG, s, v, out byte rr, out byte gg, out byte bb);
-
-                            _mask[di + 0] = bb;   // B
-                            _mask[di + 1] = gg;   // G
-                            _mask[di + 2] = rr;   // R
-                            _mask[di + 3] = 255;  // A (opaque)
+                            localMask[di + 0] = bb;
+                            localMask[di + 1] = gg;
+                            localMask[di + 2] = rr;
+                            localMask[di + 3] = 255;
                         }
                         else
                         {
-                            _mask[di + 0] = 0;
-                            _mask[di + 1] = 0;
-                            _mask[di + 2] = 0;
-                            _mask[di + 3] = 0;    // transparent
+                            localMask[di + 3] = 0; // transparent
                         }
                     }
                 }
-            }
-            finally
-            {
-                bmp.UnlockBits(data);
-            }
 
-            // 3) Push mask to the overlay
-            _overlay.WritePixels(new Int32Rect(0, 0, _w, _h), _mask, _stride, 0);
+                // Write this rect into the full-screen overlay at the correct offset
+                int destX = capLeft - _left;
+                int destY = capTop - _top;
+
+                _overlay.WritePixels(new Int32Rect(destX, destY, capW, capH), localMask, localStride, 0);
+            }
         }
+
 
         // ---- Click-through / no-activate / don't-capture-self ----
         protected override void OnSourceInitialized(EventArgs e)
@@ -246,5 +282,76 @@ namespace ScreenColourReplacer
             g8 = (byte)Math.Clamp((int)MathF.Round(g * 255f), 0, 255);
             b8 = (byte)Math.Clamp((int)MathF.Round(b * 255f), 0, 255);
         }
+
+        private const string EXCEL_CLASS = "XLMAIN";
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT
+        {
+            public int Left, Top, Right, Bottom;
+            public int Width => Right - Left;
+            public int Height => Bottom - Top;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT { public int X, Y; }
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+        [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
+
+        [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
+        [DllImport("user32.dll")] private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
+
+        private static System.Collections.Generic.List<RECT> GetExcelClientRects()
+        {
+            var rects = new System.Collections.Generic.List<RECT>();
+
+            EnumWindows((hWnd, _) =>
+            {
+                if (!IsWindowVisible(hWnd) || IsIconic(hWnd)) return true;
+
+                var sb = new System.Text.StringBuilder(256);
+                GetClassName(hWnd, sb, sb.Capacity);
+                if (!string.Equals(sb.ToString(), EXCEL_CLASS, StringComparison.Ordinal))
+                    return true;
+
+                // client rect -> screen coords
+                if (!GetClientRect(hWnd, out var rcClient)) return true;
+                if (rcClient.Width <= 0 || rcClient.Height <= 0) return true;
+
+                var tl = new POINT { X = rcClient.Left, Y = rcClient.Top };
+                var br = new POINT { X = rcClient.Right, Y = rcClient.Bottom };
+                ClientToScreen(hWnd, ref tl);
+                ClientToScreen(hWnd, ref br);
+
+                rects.Add(new RECT { Left = tl.X, Top = tl.Y, Right = br.X, Bottom = br.Y });
+                return true;
+            }, IntPtr.Zero);
+
+            return rects;
+        }
+
+        private static bool SameRects(System.Collections.Generic.List<RECT> a, System.Collections.Generic.List<RECT> b)
+        {
+            if (a.Count != b.Count) return false;
+            for (int i = 0; i < a.Count; i++)
+            {
+                if (a[i].Left != b[i].Left || a[i].Top != b[i].Top || a[i].Right != b[i].Right || a[i].Bottom != b[i].Bottom)
+                    return false;
+            }
+            return true;
+        }
+
+        private void ClearOverlay()
+        {
+            if (_overlay == null || _mask == null) return;
+            Array.Clear(_mask, 0, _mask.Length);
+            _overlay.WritePixels(new Int32Rect(0, 0, _w, _h), _mask, _stride, 0);
+        }
+
     }
 }
