@@ -213,7 +213,8 @@ namespace ScreenColourReplacer
             }
 
             // 2) Build occluder Z-order ONCE per tick
-            BuildZOrderCache();
+            var interest = UnionAll(wins);
+            BuildZOrderCache(interest);
 
             _overlay.Lock();
             try
@@ -333,8 +334,19 @@ namespace ScreenColourReplacer
             CleanupCacheForClosedWindows(wins);
         }
 
+        private static RECT UnionAll(IReadOnlyList<ExcelWin> wins)
+        {
+            int l = int.MaxValue, t = int.MaxValue, r = int.MinValue, b = int.MinValue;
+            for (int i = 0; i < wins.Count; i++)
+            {
+                var w = wins[i].Rect;
+                l = Math.Min(l, w.Left); t = Math.Min(t, w.Top);
+                r = Math.Max(r, w.Right); b = Math.Max(b, w.Bottom);
+            }
+            return new RECT { Left = l, Top = t, Right = r, Bottom = b };
+        }
 
-        private void BuildZOrderCache()
+        private void BuildZOrderCache(RECT interest)
         {
             _zOrder.Clear();
             _zIndex.Clear();
@@ -346,11 +358,13 @@ namespace ScreenColourReplacer
                 if (IsIgnoredOccluderWindow(h)) continue;
 
                 if (!GetWindowRect(h, out var wr)) continue;
+                if (!Intersect(wr, interest, out _)) continue; // <<< huge prune
 
                 _zIndex[h] = _zOrder.Count;
                 _zOrder.Add((h, wr));
             }
         }
+
 
         private List<RECT> GetVisibleExcelRects_FromZ(
             RECT excelRect,
