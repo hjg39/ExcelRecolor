@@ -77,6 +77,15 @@ namespace ScreenColourReplacer
         private readonly List<ExcelWin> _wins = new(4);
         private readonly StringBuilder _classSb = new(16);
 
+        private readonly List<DrawJob> _jobs = new(8);
+
+        private struct DrawJob
+        {
+            public CaptureCache Cc;
+            public RECT ExcelRect;         // screen rect of the Excel client
+            public List<RECT> Visibles;    // screen-space rects (already clipped), owned by that CaptureCache
+        }
+
         public MainWindow()
         {
             InitializeComponent();
@@ -185,12 +194,14 @@ namespace ScreenColourReplacer
 
             var wins = GetExcelWindows_Reused();
 
-            // 1) Compute stale regions (moved/closed Excel windows) BEFORE lock, but DO NOT clear yet
+            // 1) Compute stale regions from previous snapshot -> current (no lock)
             CollectStaleRegions(_lastWins, wins, _staleRects);
 
-            _lastWins = wins;
+            // IMPORTANT: _wins is reused, so we must snapshot into _lastWins (not assign reference!)
+            _lastWins.Clear();
+            _lastWins.AddRange(wins);
 
-            // If no Excel windows, just clear stale and exit
+            // If no Excel windows, only clear stale (lock only for blit)
             if (wins.Count == 0)
             {
                 if (_staleRects.Count == 0) return;
@@ -209,85 +220,109 @@ namespace ScreenColourReplacer
                     _overlay.Unlock();
                 }
 
-                // Also cleanup caches
                 CleanupCacheForClosedWindows(wins);
                 return;
             }
 
-            // 2) Build occluder Z-order ONCE per tick
+            // 2) Build occluder Z-order ONCE per tick (no lock)
             var interest = UnionAll(wins);
             BuildZOrderCache(interest);
 
+            // 3) Phase A: determine what needs drawing + capture/hash OUTSIDE overlay lock
+            _jobs.Clear();
+
+            IntPtr screenDc = _screenDc;
+            if (screenDc == IntPtr.Zero) return;
+
+            for (int wi = 0; wi < wins.Count; wi++)
+            {
+                var w = wins[wi];
+
+                if (!ClipToVirtualScreen(w.Rect, out _)) continue;
+
+                int fullW = w.Rect.Width;
+                int fullH = w.Rect.Height;
+                if (fullW <= 0 || fullH <= 0) continue;
+
+                var key = new CacheKey(w.Hwnd, fullW, fullH);
+                if (!_cache.TryGetValue(key, out var cc))
+                {
+                    cc = new CaptureCache(fullW, fullH);
+                    RemoveOtherSizesForHwnd(w.Hwnd, fullW, fullH);
+                    _cache[key] = cc;
+                }
+
+                if (!_zIndex.TryGetValue(w.Hwnd, out int excelZi))
+                    excelZi = _zOrder.Count;
+
+                // Visible rects from cached Z-order
+                var visiblesRaw = GetVisibleExcelRects_FromZ(w.Rect, excelZi, cc.TmpVisA, cc.TmpVisB);
+
+                // Clip to virtual screen into reused list
+                var visibles = cc.TmpClipped;
+                visibles.Clear();
+                for (int i = 0; i < visiblesRaw.Count; i++)
+                    if (ClipToVirtualScreen(visiblesRaw[i], out var cap))
+                        visibles.Add(cap);
+
+                // Visibility signature
+                ulong visSig = ComputeRectsSignature_NoSort(visibles);
+                bool visChanged = !cc.HasLastVisSig || visSig != cc.LastVisSig;
+
+                // Capture + hash (outside lock)
+                cc.CaptureExcelClientOrFallback(w.Hwnd, screenDc, w.Rect.Left, w.Rect.Top);
+                ulong sig = ComputeSignatureFull(cc.BitsPtr, cc.SrcStride, fullW, fullH);
+
+                bool contentChanged = !cc.HasLastSig || sig != cc.LastSig;
+
+                if (!contentChanged && !visChanged)
+                    continue;
+
+                // Update sig cache only when content changed
+                if (contentChanged)
+                {
+                    cc.LastSig = sig;
+                    cc.HasLastSig = true;
+                }
+
+                // We’re going to redraw, so update vis cache now
+                cc.LastVisSig = visSig;
+                cc.HasLastVisSig = true;
+
+                _jobs.Add(new DrawJob { Cc = cc, ExcelRect = w.Rect, Visibles = visibles });
+            }
+
+            // If nothing to draw and no stale to clear, we can skip lock entirely
+            if (_jobs.Count == 0 && _staleRects.Count == 0)
+            {
+                CleanupCacheForClosedWindows(wins);
+                return;
+            }
+
+            // 4) Phase B: do all backbuffer writes inside overlay lock
             _overlay.Lock();
             try
             {
                 IntPtr dstBackBuffer = _overlay.BackBuffer;
                 int dstStride = _overlay.BackBufferStride;
 
-                // 3) Clear stale rects using backbuffer (no WritePixels)
+                // Clear stale rects
                 for (int i = 0; i < _staleRects.Count; i++)
                     ClearBackBufferRect_ScreenSpace(dstBackBuffer, dstStride, _staleRects[i]);
 
-                // Use held DC
-                IntPtr screenDc = _screenDc;
-                if (screenDc == IntPtr.Zero) return;
-
-                foreach (var w in wins)
+                // Draw jobs
+                for (int j = 0; j < _jobs.Count; j++)
                 {
-                    if (!ClipToVirtualScreen(w.Rect, out _)) continue;
-
-                    int fullW = w.Rect.Width;
-                    int fullH = w.Rect.Height;
-                    if (fullW <= 0 || fullH <= 0) continue;
-
-                    var key = new CacheKey(w.Hwnd, fullW, fullH);
-                    if (!_cache.TryGetValue(key, out var cc))
-                    {
-                        cc = new CaptureCache(fullW, fullH);
-                        RemoveOtherSizesForHwnd(w.Hwnd, fullW, fullH);
-                        _cache[key] = cc;
-                    }
-
-                    // Find Excel’s Z position (if missing, treat as bottom: everything is above it)
-                    if (!_zIndex.TryGetValue(w.Hwnd, out int excelZi))
-                        excelZi = _zOrder.Count;
-
-                    // Visible rects from cached Z-order
-                    var visiblesRaw = GetVisibleExcelRects_FromZ(w.Rect, excelZi, cc.TmpVisA, cc.TmpVisB);
-
-                    // Clip to virtual screen into reused list
-                    var visibles = cc.TmpClipped;
-                    visibles.Clear();
-                    for (int i = 0; i < visiblesRaw.Count; i++)
-                    {
-                        if (ClipToVirtualScreen(visiblesRaw[i], out var cap))
-                            visibles.Add(cap);
-                    }
-
-                    // Visibility signature (changes when Excel goes behind something / uncovered)
-                    ulong visSig = ComputeRectsSignature_NoSort(visibles);
-
-                    // Capture ONCE for the whole Excel client
-                    cc.CaptureExcelClientOrFallback(w.Hwnd, screenDc, w.Rect.Left, w.Rect.Top);
-
-                    // Pixel signature (content changes)
-                    ulong sig = ComputeSignatureFull(cc.BitsPtr, cc.SrcStride, fullW, fullH);
-
-                    // Decide if we must update: content OR visibility changed
-                    bool contentChanged = !cc.HasLastSig || sig != cc.LastSig;
-                    bool visChanged = !cc.HasLastVisSig || visSig != cc.LastVisSig;
-
-                    if (!contentChanged && !visChanged)
-                        continue;
+                    var job = _jobs[j];
+                    var cc = job.Cc;
+                    var excelRect = job.ExcelRect;
+                    var visibles = job.Visibles;
 
                     // Clear what we drew last time for this hwnd
                     for (int i = 0; i < cc.LastVisibleRects.Count; i++)
                         ClearBackBufferRect_ScreenSpace(dstBackBuffer, dstStride, cc.LastVisibleRects[i]);
 
-                    // Update stored visibility
-                    cc.LastVisSig = visSig;
-                    cc.HasLastVisSig = true;
-
+                    // Update stored visibility rects
                     cc.LastVisibleRects.Clear();
                     cc.LastVisibleRects.AddRange(visibles);
 
@@ -299,8 +334,8 @@ namespace ScreenColourReplacer
                         int capW = cap.Width;
                         int capH = cap.Height;
 
-                        int srcX = cap.Left - w.Rect.Left;
-                        int srcY = cap.Top - w.Rect.Top;
+                        int srcX = cap.Left - excelRect.Left;
+                        int srcY = cap.Top - excelRect.Top;
 
                         int dstX = cap.Left - _vsLeft;
                         int dstY = cap.Top - _vsTop;
@@ -323,6 +358,7 @@ namespace ScreenColourReplacer
 
             CleanupCacheForClosedWindows(wins);
         }
+
 
 
         private static RECT UnionAll(IReadOnlyList<ExcelWin> wins)
@@ -451,8 +487,6 @@ namespace ScreenColourReplacer
                     int size = sb.Capacity;
                     if (QueryFullProcessImageName(hProc, 0, sb, ref size))
                     {
-                        string exe = Path.GetFileName(sb.ToString());
-
                         // Snipping Tool / clipping overlay (most common)
                         if (EndsWithExe(sb, "ScreenClippingHost.exe") || EndsWithExe(sb, "SnippingTool.exe"))
                             ignored = true;
