@@ -69,6 +69,7 @@ namespace ScreenColourReplacer
         private readonly List<RECT> _staleRects = new(64);
         private readonly Dictionary<IntPtr, RECT> _tmpNewByHwnd = new(16);
 
+        private int _inTick;
 
         public MainWindow()
         {
@@ -124,6 +125,22 @@ namespace ScreenColourReplacer
         }
 
 
+        private void Tick()
+        {
+            if (Interlocked.Exchange(ref _inTick, 1) == 1)
+                return;
+
+            try
+            {
+                TickCore();
+            }
+            finally
+            {
+                Volatile.Write(ref _inTick, 0);
+            }
+        }
+
+
 
         private unsafe ulong ComputeSignatureSampled(IntPtr bits, int stride, int w, int h)
         {
@@ -160,7 +177,7 @@ namespace ScreenColourReplacer
             SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
         }
 
-        private void Tick()
+        private void TickCore()
         {
             if (_overlay == null) return;
 
