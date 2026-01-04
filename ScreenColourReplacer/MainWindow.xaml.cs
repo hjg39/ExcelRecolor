@@ -160,19 +160,30 @@ namespace ScreenColourReplacer
         private unsafe ulong ComputeSignatureFull(IntPtr bits, int stride, int w, int h)
         {
             int rowBytes = w * 4;
-            byte* p = (byte*)bits.ToPointer();
 
             var hasher = new XxHash3();
-            for (int y = 0; y < h; y++)
+
+            // Your DIB uses SrcStride = w*4, so it's contiguous. If that ever changes, fallback row-wise.
+            if (stride == rowBytes)
             {
-                var row = new ReadOnlySpan<byte>(p + y * stride, rowBytes);
-                hasher.Append(row);
+                var all = new ReadOnlySpan<byte>(bits.ToPointer(), h * stride);
+                hasher.Append(all);
+            }
+            else
+            {
+                byte* p = (byte*)bits.ToPointer();
+                for (int y = 0; y < h; y++)
+                {
+                    var row = new ReadOnlySpan<byte>(p + y * stride, rowBytes);
+                    hasher.Append(row);
+                }
             }
 
             Span<byte> out8 = stackalloc byte[8];
             hasher.GetCurrentHash(out8);
             return BinaryPrimitives.ReadUInt64LittleEndian(out8);
         }
+
 
         private unsafe ulong ComputeSignatureVisibleRects(
     IntPtr bits,
@@ -250,6 +261,8 @@ namespace ScreenColourReplacer
 
             // 1) Compute stale regions from previous snapshot -> current (no lock)
             CollectStaleRegions(_lastWins, wins, _staleRects);
+            CoalesceRectsInPlace(_staleRects);
+
 
             // IMPORTANT: _wins is reused, so we must snapshot into _lastWins (not assign reference!)
             _lastWins.Clear();
@@ -318,6 +331,8 @@ namespace ScreenColourReplacer
                 for (int i = 0; i < visiblesRaw.Count; i++)
                     if (ClipToVirtualScreen(visiblesRaw[i], out var cap))
                         visibles.Add(cap);
+
+                CoalesceRectsInPlace(visibles);
 
                 // Visibility signature
                 ulong visSig = ComputeRectsSignature_NoSort(visibles);
@@ -506,6 +521,74 @@ namespace ScreenColourReplacer
             return cur; // either a or b
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool CanMergeH(in RECT a, in RECT b) =>
+    a.Top == b.Top && a.Bottom == b.Bottom && a.Right == b.Left;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool CanMergeV(in RECT a, in RECT b) =>
+            a.Left == b.Left && a.Right == b.Right && a.Bottom == b.Top;
+
+        private static void CoalesceRectsInPlace(List<RECT> rects)
+        {
+            if (rects.Count < 2) return;
+
+            // Sort once here so:
+            //  - coalescing is effective
+            //  - rect order becomes stable, letting you remove sorts elsewhere if desired
+            rects.Sort(static (a, b) =>
+            {
+                int c = a.Top.CompareTo(b.Top);
+                if (c != 0) return c;
+                c = a.Left.CompareTo(b.Left);
+                if (c != 0) return c;
+                c = a.Bottom.CompareTo(b.Bottom);
+                if (c != 0) return c;
+                return a.Right.CompareTo(b.Right);
+            });
+
+            // 1) Horizontal merge pass
+            int write = 0;
+            RECT cur = rects[0];
+            for (int i = 1; i < rects.Count; i++)
+            {
+                var r = rects[i];
+                if (CanMergeH(cur, r))
+                {
+                    cur.Right = r.Right;
+                }
+                else
+                {
+                    rects[write++] = cur;
+                    cur = r;
+                }
+            }
+            rects[write++] = cur;
+            if (write < rects.Count) rects.RemoveRange(write, rects.Count - write);
+
+            if (rects.Count < 2) return;
+
+            // 2) Vertical merge pass (same sort order still works)
+            write = 0;
+            cur = rects[0];
+            for (int i = 1; i < rects.Count; i++)
+            {
+                var r = rects[i];
+                if (CanMergeV(cur, r))
+                {
+                    cur.Bottom = r.Bottom;
+                }
+                else
+                {
+                    rects[write++] = cur;
+                    cur = r;
+                }
+            }
+            rects[write++] = cur;
+            if (write < rects.Count) rects.RemoveRange(write, rects.Count - write);
+        }
+
+
         private void CollectStaleRegions(List<ExcelWin> oldWins, List<ExcelWin> newWins, List<RECT> outRects)
         {
             outRects.Clear();
@@ -534,11 +617,9 @@ namespace ScreenColourReplacer
             int dstY = cap.Top - _vsTop;
 
             ClearBackBufferRect(dstBackBuffer, dstStride, dstX, dstY, w, h);
+
             _overlay!.AddDirtyRect(new Int32Rect(dstX, dstY, w, h));
         }
-
-
-
 
         private bool IsIgnoredOccluderWindow(IntPtr hwnd)
         {
