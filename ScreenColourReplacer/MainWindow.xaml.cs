@@ -523,6 +523,7 @@ namespace ScreenColourReplacer
             (76.47f, 12f, 0.18f),  // #BEDA74-ish
             (110.77f, 12f, 0.18f), // #72D560-ish
             (147.22f, 12f, 0.18f), // #0F703B / #107C41-ish
+            (161.94f, 12f, 0.18f), // #6ED5B6-ish
         };
 
         private static ulong ComputeRectsSignature(List<RECT> rects)
