@@ -7,6 +7,9 @@ using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using System.Buffers.Binary;
+using System.IO.Hashing;
+
 
 namespace ScreenColourReplacer
 {
@@ -75,6 +78,24 @@ namespace ScreenColourReplacer
             _timer.Start();
         }
 
+        private unsafe ulong ComputeSignatureFull(IntPtr bits, int stride, int w, int h)
+        {
+            int rowBytes = w * 4;
+            byte* p = (byte*)bits.ToPointer();
+
+            var hasher = new XxHash3();
+            for (int y = 0; y < h; y++)
+            {
+                var row = new ReadOnlySpan<byte>(p + y * stride, rowBytes);
+                hasher.Append(row);
+            }
+
+            Span<byte> out8 = stackalloc byte[8];
+            hasher.GetCurrentHash(out8);
+            return BinaryPrimitives.ReadUInt64LittleEndian(out8);
+        }
+
+
         // ---- Click-through / no-activate / don't-capture-self ----
         protected override void OnSourceInitialized(EventArgs e)
         {
@@ -141,6 +162,18 @@ namespace ScreenColourReplacer
                             // Capture visible region directly into DIB section bits
                             cc.CaptureScreenRegion(screenDc, cap.Left, cap.Top);
 
+                            // After capture into cc.BitsPtr...
+                            ulong sig = ComputeSignatureFull(cc.BitsPtr, cc.SrcStride, capW, capH);
+                            if (cc.HasLastSig && sig == cc.LastSig)
+                                continue;
+
+                            cc.LastSig = sig;
+                            cc.HasLastSig = true;
+
+                            // Apply LUT + AddDirtyRect
+
+
+
                             int destX = cap.Left - _vsLeft;
                             int destY = cap.Top - _vsTop;
 
@@ -150,6 +183,8 @@ namespace ScreenColourReplacer
                                 dstBackBuffer, dstStride,
                                 destX, destY,
                                 capW, capH);
+
+
 
                             // Mark dirty region
                             _overlay.AddDirtyRect(new Int32Rect(destX, destY, capW, capH));
@@ -496,6 +531,9 @@ namespace ScreenColourReplacer
         // ---------- High-performance capture cache (BitBlt -> DIB section) ----------
         private sealed class CaptureCache : IDisposable
         {
+            public ulong LastSig;
+            public bool HasLastSig;
+
             public int Width { get; }
             public int Height { get; }
             public int SrcStride { get; } // bytes per row in DIB (we create it as w*4)
