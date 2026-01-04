@@ -190,14 +190,24 @@ namespace ScreenColourReplacer
 
                         // Compute visible rects first (screen-space) and clip to virtual screen.
                         // We'll use this list BOTH for clearing and drawing.
-                        var visiblesRaw = GetVisibleExcelRects(w.Hwnd, w.Rect);
+                        IntPtr overlayHwnd = new WindowInteropHelper(this).Handle;
 
-                        var visibles = new List<RECT>(visiblesRaw.Count);
-                        foreach (var vr in visiblesRaw)
+                        // Reused visibility buffers (no allocations)
+                        var visiblesRaw = GetVisibleExcelRects_NoAlloc(
+                            w.Hwnd, w.Rect,
+                            cc.TmpVisA, cc.TmpVisB,
+                            overlayHwnd);
+
+                        // Clip into a reused list
+                        var visibles = cc.TmpClipped;
+                        visibles.Clear();
+
+                        for (int i = 0; i < visiblesRaw.Count; i++)
                         {
-                            if (ClipToVirtualScreen(vr, out var cap))
+                            if (ClipToVirtualScreen(visiblesRaw[i], out var cap))
                                 visibles.Add(cap);
                         }
+
 
                         ulong visSig = ComputeRectsSignature(visibles);
                         bool visChanged = !cc.HasLastVisSig || visSig != cc.LastVisSig;
@@ -810,6 +820,10 @@ namespace ScreenColourReplacer
             public bool HasLastVisSig;
             public readonly List<RECT> LastVisibleRects = new(); // screen-space, already clipped to virtual screen
 
+            public readonly List<RECT> TmpVisA = new(32);
+            public readonly List<RECT> TmpVisB = new(64);
+            public readonly List<RECT> TmpClipped = new(32);
+
 
             public CaptureCache(int w, int h)
             {
@@ -978,68 +992,72 @@ namespace ScreenColourReplacer
             return r.Width > 0 && r.Height > 0;
         }
 
-        private static List<RECT> SubtractRect(RECT src, RECT cut)
+        private static void SubtractRectInto(in RECT src, in RECT cut, List<RECT> dst)
         {
-            // Returns up to 4 rectangles (src minus cut)
-            var res = new List<RECT>(4);
-
             if (!Intersect(src, cut, out var i))
             {
-                res.Add(src);
-                return res;
+                dst.Add(src);
+                return;
             }
 
             // Top band
             if (src.Top < i.Top)
-                res.Add(new RECT { Left = src.Left, Top = src.Top, Right = src.Right, Bottom = i.Top });
+                dst.Add(new RECT { Left = src.Left, Top = src.Top, Right = src.Right, Bottom = i.Top });
 
             // Bottom band
             if (i.Bottom < src.Bottom)
-                res.Add(new RECT { Left = src.Left, Top = i.Bottom, Right = src.Right, Bottom = src.Bottom });
+                dst.Add(new RECT { Left = src.Left, Top = i.Bottom, Right = src.Right, Bottom = src.Bottom });
 
             // Left band
             if (src.Left < i.Left)
-                res.Add(new RECT { Left = src.Left, Top = i.Top, Right = i.Left, Bottom = i.Bottom });
+                dst.Add(new RECT { Left = src.Left, Top = i.Top, Right = i.Left, Bottom = i.Bottom });
 
             // Right band
             if (i.Right < src.Right)
-                res.Add(new RECT { Left = i.Right, Top = i.Top, Right = src.Right, Bottom = i.Bottom });
-
-            return res;
+                dst.Add(new RECT { Left = i.Right, Top = i.Top, Right = src.Right, Bottom = i.Bottom });
         }
 
-        private List<RECT> GetVisibleExcelRects(IntPtr excelHwnd, RECT excelRect)
-        {
-            // Start with the full Excel rect, subtract occluders above it.
-            var visible = new List<RECT> { excelRect };
 
-            for (IntPtr h = GetTopWindow(IntPtr.Zero); h != IntPtr.Zero && h != excelHwnd; h = GetWindow(h, GW_HWNDNEXT))
+        private List<RECT> GetVisibleExcelRects_NoAlloc(
+            IntPtr excelHwnd,
+            RECT excelRect,
+            List<RECT> a,
+            List<RECT> b,
+            IntPtr overlayHwnd)
+        {
+            a.Clear();
+            a.Add(excelRect);
+
+            var cur = a;
+            var next = b;
+
+            for (IntPtr h = GetTopWindow(IntPtr.Zero);
+                 h != IntPtr.Zero && h != excelHwnd;
+                 h = GetWindow(h, GW_HWNDNEXT))
             {
                 if (!IsWindowVisible(h) || IsIconic(h)) continue;
                 if (IsIgnoredOccluderWindow(h)) continue;
-
-                // Skip our own overlay window if it ever appears in enumeration
-                if (h == new WindowInteropHelper(this).Handle) continue;
-
-                // Optional: skip “empty” windows (tooltips etc.)
-                if (GetWindowTextLength(h) == 0) { /* you may want to keep these; leave as-is */ }
+                if (h == overlayHwnd) continue;
 
                 if (!GetWindowRect(h, out var wr)) continue;
-
-                // Only care if it overlaps Excel
                 if (!Intersect(wr, excelRect, out var overlap)) continue;
 
-                // Subtract this overlap from all current visible rects
-                var next = new List<RECT>(visible.Count * 2);
-                foreach (var v in visible)
-                    next.AddRange(SubtractRect(v, overlap));
+                next.Clear();
 
-                visible = next;
-                if (visible.Count == 0) break;
+                for (int i = 0; i < cur.Count; i++)
+                    SubtractRectInto(cur[i], overlap, next);
+
+                // swap buffers
+                var tmp = cur;
+                cur = next;
+                next = tmp;
+
+                if (cur.Count == 0) break;
             }
 
-            return visible;
+            return cur; // IMPORTANT: this is either 'a' or 'b'
         }
+
 
     }
 }
