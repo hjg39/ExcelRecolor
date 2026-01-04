@@ -142,19 +142,15 @@ namespace ScreenColourReplacer
 
 
 
-        private unsafe ulong ComputeSignatureSampled(IntPtr bits, int stride, int w, int h)
+        private unsafe ulong ComputeSignatureFull(IntPtr bits, int stride, int w, int h)
         {
             int rowBytes = w * 4;
-            int sampleRows = 12;                 // tune
-            int bytesPerRow = Math.Min(rowBytes, 16 * 1024); // tune
-
             byte* p = (byte*)bits.ToPointer();
-            var hasher = new XxHash3();
 
-            for (int i = 0; i < sampleRows; i++)
+            var hasher = new XxHash3();
+            for (int y = 0; y < h; y++)
             {
-                int y = (int)((long)i * (h - 1) / (sampleRows - 1));
-                var row = new ReadOnlySpan<byte>(p + y * stride, bytesPerRow);
+                var row = new ReadOnlySpan<byte>(p + y * stride, rowBytes);
                 hasher.Append(row);
             }
 
@@ -262,30 +258,18 @@ namespace ScreenColourReplacer
                             visibles.Add(cap);
                     }
 
+                    // Visibility signature (changes when Excel goes behind something / uncovered)
                     ulong visSig = ComputeRectsSignature(visibles);
+
+                    // Capture ONCE for the whole Excel client
+                    cc.CaptureExcelClientOrFallback(w.Hwnd, screenDc, w.Rect.Left, w.Rect.Top);
+
+                    // Pixel signature (content changes)
+                    ulong sig = ComputeSignatureFull(cc.BitsPtr, cc.SrcStride, fullW, fullH);
+
+                    // Decide if we must update: content OR visibility changed
+                    bool contentChanged = !cc.HasLastSig || sig != cc.LastSig;
                     bool visChanged = !cc.HasLastVisSig || visSig != cc.LastVisSig;
-
-                    // Capture pixels (always needed before draw; needed before sampling)
-                    cc.CaptureVisibleRects(screenDc, w.Rect, visibles);
-
-                    bool contentChanged;
-                    if (visChanged)
-                    {
-                        contentChanged = true;
-                        ulong sig = ComputeSignatureSampled(cc.BitsPtr, cc.SrcStride, fullW, fullH);
-                        cc.LastSig = sig;
-                        cc.HasLastSig = true;
-                    }
-                    else
-                    {
-                        ulong sig = ComputeSignatureSampled(cc.BitsPtr, cc.SrcStride, fullW, fullH);
-                        contentChanged = !cc.HasLastSig || sig != cc.LastSig;
-                        if (contentChanged)
-                        {
-                            cc.LastSig = sig;
-                            cc.HasLastSig = true;
-                        }
-                    }
 
                     if (!contentChanged && !visChanged)
                         continue;
