@@ -4,7 +4,6 @@ using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
-using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 
@@ -14,11 +13,11 @@ namespace ScreenColourReplacer
     {
         private readonly DispatcherTimer _timer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(100) // start at 10 FPS; adjust later
+            Interval = TimeSpan.FromMilliseconds(100) // ~10 FPS
         };
 
         private WriteableBitmap? _overlay;
-        private byte[]? _mask; // BGRA buffer
+        private byte[]? _mask; // BGRA buffer (WPF PixelFormats.Bgra32)
         private int _w, _h, _stride;
         private int _left, _top;
 
@@ -55,15 +54,15 @@ namespace ScreenColourReplacer
             if (_overlay == null || _mask == null) return;
 
             // 1) Capture screen into a 32bpp bitmap
-            using var bmp = new Bitmap(_w, _h, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            using var bmp = new Bitmap(_w, _h, PixelFormat.Format32bppArgb);
             using (var g = Graphics.FromImage(bmp))
             {
                 g.CopyFromScreen(_left, _top, 0, 0, new System.Drawing.Size(_w, _h), CopyPixelOperation.SourceCopy);
             }
 
-            // 2) Read pixels and build the overlay mask (green where black else transparent)
+            // 2) Read pixels and build the overlay mask (purple where hue matches targets, else transparent)
             var rect = new System.Drawing.Rectangle(0, 0, _w, _h);
-            var data = bmp.LockBits(rect, ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            var data = bmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
 
             try
             {
@@ -72,9 +71,6 @@ namespace ScreenColourReplacer
                 byte[] src = new byte[srcBytes];
                 Marshal.Copy(data.Scan0, src, 0, srcBytes);
 
-                // Build mask in BGRA32 (WPF expects BGRA for PixelFormats.Bgra32)
-                // Source is 32bpp ARGB in memory as BGRA on little-endian Windows (same byte order),
-                // but we don't assume stride matches; we remap per pixel.
                 for (int y = 0; y < _h; y++)
                 {
                     int srcRow = y * srcStride;
@@ -83,27 +79,34 @@ namespace ScreenColourReplacer
                     for (int x = 0; x < _w; x++)
                     {
                         int si = srcRow + x * 4;
+
+                        // src is BGRA in memory on little-endian Windows
                         byte b = src[si + 0];
                         byte g2 = src[si + 1];
                         byte r = src[si + 2];
-                        // byte a = src[si + 3]; // not needed for test
+
+                        RgbToHsv(r, g2, b, out float h, out float s, out float v);
 
                         int di = dstRow + x * 4;
 
-                        // EXACT black:
-                        if (r == 0 && g2 == 0 && b == 0)
+                        bool match = MatchesAnyTarget(h, s, v);
+
+                        if (match)
                         {
-                            _mask[di + 0] = 0;   // B
-                            _mask[di + 1] = 255; // G
-                            _mask[di + 2] = 0;   // R
-                            _mask[di + 3] = 255; // A (opaque)
+                            // Replace hue with purple, keep same saturation/value
+                            HsvToRgb(PURPLE_HUE_DEG, s, v, out byte rr, out byte gg, out byte bb);
+
+                            _mask[di + 0] = bb;   // B
+                            _mask[di + 1] = gg;   // G
+                            _mask[di + 2] = rr;   // R
+                            _mask[di + 3] = 255;  // A (opaque)
                         }
                         else
                         {
                             _mask[di + 0] = 0;
                             _mask[di + 1] = 0;
                             _mask[di + 2] = 0;
-                            _mask[di + 3] = 0;   // fully transparent
+                            _mask[di + 3] = 0;    // transparent
                         }
                     }
                 }
@@ -117,7 +120,7 @@ namespace ScreenColourReplacer
             _overlay.WritePixels(new Int32Rect(0, 0, _w, _h), _mask, _stride, 0);
         }
 
-        // ---- Click-through / no-activate ----
+        // ---- Click-through / no-activate / don't-capture-self ----
         protected override void OnSourceInitialized(EventArgs e)
         {
             base.OnSourceInitialized(e);
@@ -127,6 +130,9 @@ namespace ScreenColourReplacer
 
             exStyle = new IntPtr(exStyle.ToInt64() | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
             SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle);
+
+            // Prevent overlay being included in the capture (stops feedback flicker)
+            SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
         }
 
         private const int GWL_EXSTYLE = -20;
@@ -140,5 +146,105 @@ namespace ScreenColourReplacer
 
         [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr", SetLastError = true)]
         private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint dwAffinity);
+
+        private const uint WDA_EXCLUDEFROMCAPTURE = 0x11;
+
+        // ---- Hue matching config ----
+        // Replace these two green-ish hue families with a purple hue.
+        // #60BD82 hue ≈ 141.94°, #9FC7B1 hue ≈ 147.00°
+        private const float PURPLE_HUE_DEG = 285f; // 270–300 looks "purple"
+
+        private const float MIN_V = 0.08f; // ignore near-black pixels (optional)
+
+        private static readonly (float HueDeg, float TolDeg, float MinS)[] TARGETS =
+        {
+            (141.94f, 12f, 0.18f), // #60BD82-ish (more saturated)
+            (147.00f, 12f, 0.10f), // #9FC7B1-ish (pastel / lower saturation)
+            (148.42f, 12f, 0.04f),
+            (124.86f, 12f, 0.18f),
+            (76.47f, 12f, 0.18f),
+            (110.77f, 12f, 0.18f),
+        };
+
+        private static bool MatchesAnyTarget(float hDeg, float s, float v)
+        {
+            if (v < MIN_V) return false;
+
+            for (int i = 0; i < TARGETS.Length; i++)
+            {
+                var t = TARGETS[i];
+                if (s >= t.MinS && HueDistanceDeg(hDeg, t.HueDeg) <= t.TolDeg)
+                    return true;
+            }
+            return false;
+        }
+
+        private static float HueDistanceDeg(float a, float b)
+        {
+            float d = MathF.Abs(a - b);
+            return MathF.Min(d, 360f - d);
+        }
+
+        private static void RgbToHsv(byte r8, byte g8, byte b8, out float hDeg, out float s, out float v)
+        {
+            float r = r8 / 255f, g = g8 / 255f, b = b8 / 255f;
+            float max = MathF.Max(r, MathF.Max(g, b));
+            float min = MathF.Min(r, MathF.Min(g, b));
+            float delta = max - min;
+
+            v = max;
+            s = (max <= 0f) ? 0f : (delta / max);
+
+            if (delta <= 0f)
+            {
+                hDeg = 0f;
+                return;
+            }
+
+            float h;
+            if (max == r) h = (g - b) / delta;
+            else if (max == g) h = 2f + (b - r) / delta;
+            else h = 4f + (r - g) / delta;
+
+            h *= 60f;
+            if (h < 0f) h += 360f;
+            hDeg = h;
+        }
+
+        private static void HsvToRgb(float hDeg, float s, float v, out byte r8, out byte g8, out byte b8)
+        {
+            if (s <= 0f)
+            {
+                byte vv = (byte)Math.Clamp((int)MathF.Round(v * 255f), 0, 255);
+                r8 = g8 = b8 = vv;
+                return;
+            }
+
+            float h = (hDeg % 360f) / 60f; // 0..6
+            int i = (int)MathF.Floor(h);
+            float f = h - i;
+
+            float p = v * (1f - s);
+            float q = v * (1f - s * f);
+            float t = v * (1f - s * (1f - f));
+
+            float r, g, b;
+            switch (i)
+            {
+                case 0: r = v; g = t; b = p; break;
+                case 1: r = q; g = v; b = p; break;
+                case 2: r = p; g = v; b = t; break;
+                case 3: r = p; g = q; b = v; break;
+                case 4: r = t; g = p; b = v; break;
+                default: r = v; g = p; b = q; break; // case 5
+            }
+
+            r8 = (byte)Math.Clamp((int)MathF.Round(r * 255f), 0, 255);
+            g8 = (byte)Math.Clamp((int)MathF.Round(g * 255f), 0, 255);
+            b8 = (byte)Math.Clamp((int)MathF.Round(b * 255f), 0, 255);
+        }
     }
 }
