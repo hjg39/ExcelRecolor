@@ -137,12 +137,40 @@ namespace ScreenColourReplacer
                 IntPtr dstBackBuffer = _overlay.BackBuffer;
                 int dstStride = _overlay.BackBufferStride;
 
-                // Optional but recommended: get screen DC once per tick
                 IntPtr screenDc = GetDC(IntPtr.Zero);
                 try
                 {
                     foreach (var w in wins)
                     {
+                        // Clip to virtual screen just to avoid pointless work
+                        if (!ClipToVirtualScreen(w.Rect, out var capWin)) continue;
+
+                        int fullW = w.Rect.Width;
+                        int fullH = w.Rect.Height;
+                        if (fullW <= 0 || fullH <= 0) continue;
+
+                        // Cache is for the FULL client size (not clipped)
+                        var key = new CacheKey(w.Hwnd, fullW, fullH);
+                        if (!_cache.TryGetValue(key, out var cc))
+                        {
+                            cc = new CaptureCache(fullW, fullH);
+                            RemoveOtherSizesForHwnd(w.Hwnd, fullW, fullH);
+
+                            _cache[key] = cc;
+                        }
+
+                        // Capture ONCE for the whole Excel client
+                        cc.CaptureExcelClientOrFallback(w.Hwnd, screenDc, w.Rect.Left, w.Rect.Top);
+
+                        // Dirty-check ONCE for the whole captured client
+                        ulong sig = ComputeSignatureFull(cc.BitsPtr, cc.SrcStride, fullW, fullH);
+                        if (cc.HasLastSig && sig == cc.LastSig)
+                            continue;
+
+                        cc.LastSig = sig;
+                        cc.HasLastSig = true;
+
+                        // Now compute visible rects (to avoid painting over occluders)
                         var visibles = GetVisibleExcelRects(w.Hwnd, w.Rect);
 
                         foreach (var vr in visibles)
@@ -152,42 +180,22 @@ namespace ScreenColourReplacer
                             int capW = cap.Width;
                             int capH = cap.Height;
 
-                            var key = new CacheKey(w.Hwnd, capW, capH);
-                            if (!_cache.TryGetValue(key, out var cc))
-                            {
-                                cc = new CaptureCache(capW, capH);
-                                _cache[key] = cc;
-                            }
+                            // Source offsets inside the captured Excel client buffer
+                            int srcX = cap.Left - w.Rect.Left;
+                            int srcY = cap.Top - w.Rect.Top;
 
-                            // Capture visible region directly into DIB section bits
-                            cc.CaptureScreenRegion(screenDc, cap.Left, cap.Top);
+                            // Destination offsets inside the overlay
+                            int dstX = cap.Left - _vsLeft;
+                            int dstY = cap.Top - _vsTop;
 
-                            // After capture into cc.BitsPtr...
-                            ulong sig = ComputeSignatureFull(cc.BitsPtr, cc.SrcStride, capW, capH);
-                            if (cc.HasLastSig && sig == cc.LastSig)
-                                continue;
-
-                            cc.LastSig = sig;
-                            cc.HasLastSig = true;
-
-                            // Apply LUT + AddDirtyRect
-
-
-
-                            int destX = cap.Left - _vsLeft;
-                            int destY = cap.Top - _vsTop;
-
-                            // Apply LUT directly into overlay backbuffer
-                            ApplyLutToBackBuffer(
+                            ApplyLutToBackBuffer_WithSrcOffset(
                                 cc.BitsPtr, cc.SrcStride,
                                 dstBackBuffer, dstStride,
-                                destX, destY,
+                                srcX, srcY,
+                                dstX, dstY,
                                 capW, capH);
 
-
-
-                            // Mark dirty region
-                            _overlay.AddDirtyRect(new Int32Rect(destX, destY, capW, capH));
+                            _overlay.AddDirtyRect(new Int32Rect(dstX, dstY, capW, capH));
                         }
                     }
                 }
@@ -200,6 +208,7 @@ namespace ScreenColourReplacer
             {
                 _overlay.Unlock();
             }
+
 
             CleanupCacheForClosedWindows(wins);
         }
@@ -301,9 +310,10 @@ namespace ScreenColourReplacer
 
 
         // ---------- LUT application ----------
-        private unsafe void ApplyLutToBackBuffer(
+        private unsafe void ApplyLutToBackBuffer_WithSrcOffset(
             IntPtr srcBits, int srcStride,
             IntPtr dstBackBuffer, int dstStride,
+            int srcX, int srcY,
             int dstX, int dstY,
             int w, int h)
         {
@@ -312,9 +322,8 @@ namespace ScreenColourReplacer
 
             for (int y = 0; y < h; y++)
             {
-                byte* sRow = srcBase + y * srcStride;
+                byte* sRow = srcBase + (srcY + y) * srcStride + srcX * 4;
 
-                // Destination row start in the full-screen overlay backbuffer
                 byte* dRowBytes = dstBase + (dstY + y) * dstStride + dstX * 4;
                 uint* dRow = (uint*)dRowBytes;
 
@@ -330,11 +339,11 @@ namespace ScreenColourReplacer
                     int bQ = b >> (8 - LUT_BITS);
 
                     int idx = ((rQ * LUT_SIZE + gQ) * LUT_SIZE + bQ);
-
-                    dRow[x] = _lut32[idx]; // single 32-bit store
+                    dRow[x] = _lut32[idx];
                 }
             }
         }
+
 
 
         private void BuildLut()
@@ -528,17 +537,40 @@ namespace ScreenColourReplacer
             return wins;
         }
 
+        private void RemoveOtherSizesForHwnd(IntPtr hwnd, int keepW, int keepH)
+        {
+            List<CacheKey>? kill = null;
+
+            foreach (var kv in _cache)
+            {
+                if (kv.Key.Hwnd == hwnd && (kv.Key.W != keepW || kv.Key.H != keepH))
+                {
+                    kill ??= new List<CacheKey>();
+                    kill.Add(kv.Key);
+                }
+            }
+
+            if (kill == null) return;
+
+            foreach (var k in kill)
+            {
+                _cache[k].Dispose();
+                _cache.Remove(k);
+            }
+        }
+
+
         // ---------- High-performance capture cache (BitBlt -> DIB section) ----------
         private sealed class CaptureCache : IDisposable
         {
-            public ulong LastSig;
-            public bool HasLastSig;
-
             public int Width { get; }
             public int Height { get; }
-            public int SrcStride { get; } // bytes per row in DIB (we create it as w*4)
+            public int SrcStride { get; } // w * 4
 
             public IntPtr BitsPtr => _bitsPtr;
+
+            public ulong LastSig;
+            public bool HasLastSig;
 
             private readonly IntPtr _memDc;
             private readonly IntPtr _hBmp;
@@ -553,12 +585,11 @@ namespace ScreenColourReplacer
 
                 _memDc = CreateCompatibleDC(IntPtr.Zero);
 
-                // Create top-down 32bpp DIB section
                 BITMAPINFO bmi = new BITMAPINFO
                 {
                     biSize = (uint)Marshal.SizeOf<BITMAPINFO>(),
                     biWidth = w,
-                    biHeight = -h, // negative => top-down
+                    biHeight = -h,
                     biPlanes = 1,
                     biBitCount = 32,
                     biCompression = BI_RGB
@@ -570,11 +601,25 @@ namespace ScreenColourReplacer
                 _oldObj = SelectObject(_memDc, _hBmp);
             }
 
-            // IMPORTANT: this now needs a screenDc passed in (so Tick can Lock once and reuse DC)
+            public bool CaptureExcelClient(IntPtr hwnd)
+            {
+                // Capture the client area (Excel grid) into our DIB.
+                // Note: PW_RENDERFULLCONTENT helps for some windows, Excel may ignore it.
+                return PrintWindow(hwnd, _memDc, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
+            }
+
             public void CaptureScreenRegion(IntPtr screenDc, int screenX, int screenY)
             {
                 BitBlt(_memDc, 0, 0, Width, Height, screenDc, screenX, screenY, SRCCOPY);
-                // No Marshal.Copy, pixels stay in _bitsPtr
+            }
+
+            public void CaptureExcelClientOrFallback(IntPtr hwnd, IntPtr screenDc, int screenX, int screenY)
+            {
+                if (!CaptureExcelClient(hwnd))
+                {
+                    // Fallback: copy from screen (client rect position).
+                    CaptureScreenRegion(screenDc, screenX, screenY);
+                }
             }
 
             public void Dispose()
@@ -584,6 +629,7 @@ namespace ScreenColourReplacer
                 if (_memDc != IntPtr.Zero) DeleteDC(_memDc);
             }
         }
+
 
 
         // ---------- P/Invokes for capture ----------
@@ -663,6 +709,13 @@ namespace ScreenColourReplacer
         [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
         [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
         [DllImport("user32.dll")] private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
+
+        private const uint PW_CLIENTONLY = 0x00000001;
+        private const uint PW_RENDERFULLCONTENT = 0x00000002; // harmless if ignored
+
 
         private static bool Intersect(in RECT a, in RECT b, out RECT r)
         {
