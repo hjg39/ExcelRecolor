@@ -1,12 +1,25 @@
-# ExcelRecolor
-A small app that creates a screen overlay that replaces green Excel pixels with a configurable hue, defaulting to Purple.
+# ExcelRecolor 🎨📊
 
-Made messily with AI to get it out quickly - pls do not judge the terrible layout, method naming, non-seperation of classes etc.
+**ExcelRecolor** is a tiny Windows app that draws a transparent overlay on top of Excel and **recolors “Excel green” pixels** to a hue you choose — **purple by default**.
 
-# Use
+It’s intentionally lightweight: no Excel plugins, no workbook changes — just what you see on-screen.
 
-Simply update the config file with the degree in the colour wheel (0-359) of your target hue.
+> Built fast (with AI help) to solve a real problem. The code is functional-first, not architecture-first 😄
 
-Download the app here:
+---
 
-https://github.com/hjg39/ExcelRecolor/releases
+## Features
+- ✅ Recolors green-ish Excel UI elements in real time
+- ✅ Configurable target hue (0–359°)
+- ✅ No Office add-ins / macros / workbook modification
+- ✅ Overlay excludes itself from screen capture
+
+---
+
+## Usage
+1. Download the latest release:
+   - https://github.com/hjg39/ExcelRecolor/releases
+
+2. Edit `ScreenColourReplacer.config` (next to the `.exe`) and set:
+   ```ini
+   HUE=[whatever hue on the colour wheel (0-359) you want]
