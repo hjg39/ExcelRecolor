@@ -35,6 +35,8 @@ namespace ScreenColourReplacer
         private const int LUT_BITS = 5;  // 5 => 32 levels/channel (32^3 = 32768)
         private const int LUT_SIZE = 1 << LUT_BITS;
         private const int LUT_MASK = LUT_SIZE - 1;
+        private const int HOT_SKIP_HASH_TICKS = 4; // keep in sync with your HotCountdown usage
+
 
         private readonly HashSet<IntPtr> _aliveHwnds = new();
         private readonly List<CacheKey> _toDeleteKeys = new();
@@ -440,37 +442,49 @@ namespace ScreenColourReplacer
 
 
 
-                ulong sig;
+                bool inHot = (!visChanged && cc.HotCountdown > 0);
 
-                // Capture + hash (outside lock)
                 if (fullyVisible)
                 {
-                    // Full capture + full hash
-                    cc.CaptureScreenRegion(screenDc, w.Rect.Left, w.Rect.Top); // same as your current fallback
-                    sig = ComputeSignatureFull(cc.BitsPtr, cc.SrcStride, fullW, fullH);
+                    cc.CaptureScreenRegion(screenDc, w.Rect.Left, w.Rect.Top);
+
+                    if (!inHot)
+                    {
+                        ulong sig = ComputeSignatureFull(cc.BitsPtr, cc.SrcStride, fullW, fullH);
+                        bool contentChanged = !cc.HasLastSig || sig != cc.LastSig;
+
+                        if (!contentChanged && !visChanged)
+                            continue;
+
+                        cc.LastSig = sig;
+                        cc.HasLastSig = true;
+                    }
+                    // else: hot => skip hash/compare, we'll draw
                 }
                 else
                 {
-                    // Only capture visible pieces + hash only those pieces
                     cc.CaptureVisibleRects(screenDc, w.Rect, visibles);
-                    sig = ComputeSignatureVisibleRects(cc.BitsPtr, cc.SrcStride, w.Rect, visibles);
+
+                    if (!inHot)
+                    {
+                        ulong sig = ComputeSignatureVisibleRects(cc.BitsPtr, cc.SrcStride, w.Rect, visibles);
+                        bool contentChanged = !cc.HasLastSig || sig != cc.LastSig;
+
+                        if (!contentChanged && !visChanged)
+                            continue;
+
+                        cc.LastSig = sig;
+                        cc.HasLastSig = true;
+                    }
+                    // else: hot => skip hash/compare, we'll draw
                 }
 
-                bool contentChanged = !cc.HasLastSig || sig != cc.LastSig;
-
-                if (!contentChanged && !visChanged)
-                    continue;
-
-                // Update sig cache (we computed sig in both branches above)
-                cc.LastSig = sig;
-                cc.HasLastSig = true;
-
-                // Update visibility cache
+                // Update visibility cache ALWAYS (still needed for occlusion changes)
                 cc.LastVisSig = visSig;
                 cc.HasLastVisSig = true;
 
+                // Add job (in hot mode we always add; in non-hot mode we already continued if nothing changed)
                 _jobs.Add(new DrawJob { Cc = cc, ExcelRect = w.Rect, Visibles = visibles, VisChanged = visChanged });
-
             }
 
             // If nothing to draw and no stale to clear, we can skip lock entirely
