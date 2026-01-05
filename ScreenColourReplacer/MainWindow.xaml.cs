@@ -10,7 +10,7 @@ using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
-
+using System.Diagnostics;
 
 
 namespace ScreenColourReplacer
@@ -146,6 +146,24 @@ namespace ScreenColourReplacer
             _screenDc = GetDC(IntPtr.Zero);
 
             _timer.Start();
+
+            try
+            {
+                var p = Process.GetCurrentProcess();
+                p.PriorityClass = ProcessPriorityClass.BelowNormal;
+                p.PriorityBoostEnabled = false; // optional: avoid temporary boosts
+            }
+            catch
+            {
+                // ignore if not allowed
+            }
+
+            try
+            {
+                Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+            }
+            catch { }
+
         }
 
         protected override void OnClosed(EventArgs e)
