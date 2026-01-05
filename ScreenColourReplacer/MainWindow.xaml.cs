@@ -56,7 +56,18 @@ namespace ScreenColourReplacer
 
         private readonly uint[] _lut32 = new uint[LUT_SIZE * LUT_SIZE * LUT_SIZE]; // packed BGRA in little-endian
 
-        private readonly Dictionary<uint, bool> _pidIsIgnoredOccluder = new();
+        private enum ProcKind : byte
+        {
+            Unknown = 0,
+            AlwaysIgnore,   // snipping overlays etc
+            ZoomShare,      // only ignore if it looks like a share toolbar
+            TeamsShare,     // only ignore if it looks like a share toolbar
+            ChromiumShare,  // only ignore if it looks like a share toolbar
+            Other
+        }
+
+        private readonly Dictionary<uint, ProcKind> _pidKind = new();
+
         private int _pidCacheSweepCounter = 0;
 
         // --- Tick re-entrancy guard ---
@@ -502,54 +513,90 @@ namespace ScreenColourReplacer
         }
 
 
-        private bool IsIgnoredOccluderWindow(IntPtr hwnd)
+        private bool IsIgnoredOccluderWindow(IntPtr hwnd, in RECT wr, long exStyle)
         {
             uint pid;
             GetWindowThreadProcessId(hwnd, out pid);
             if (pid == 0) return false;
 
-            // Very cheap periodic cache reset (every ~2000 occluder checks)
+            // Periodic cache reset
             if (++_pidCacheSweepCounter > 2000)
             {
                 _pidCacheSweepCounter = 0;
-                _pidIsIgnoredOccluder.Clear();
+                _pidKind.Clear();
             }
 
-            if (_pidIsIgnoredOccluder.TryGetValue(pid, out bool cached))
-                return cached;
-
-            bool ignored = false;
-
-            IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-            if (hProc != IntPtr.Zero)
+            if (!_pidKind.TryGetValue(pid, out var kind))
             {
-                try
+                kind = ProcKind.Other;
+
+                IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                if (hProc != IntPtr.Zero)
                 {
-                    _procPathSb.Clear();
-                    _procPathSb.EnsureCapacity(1024);
-                    int size = _procPathSb.Capacity;
-
-                    if (QueryFullProcessImageName(hProc, 0, _procPathSb, ref size))
+                    try
                     {
-                        // size is chars written (excluding null)
-                        int len = size;
+                        _procPathSb.Clear();
+                        _procPathSb.EnsureCapacity(1024);
+                        int size = _procPathSb.Capacity;
 
-                        if (ExeNameEqualsIgnoreCase(_procPathSb, len, "ScreenClippingHost.exe") ||
-                            ExeNameEqualsIgnoreCase(_procPathSb, len, "SnippingTool.exe"))
+                        if (QueryFullProcessImageName(hProc, 0, _procPathSb, ref size))
                         {
-                            ignored = true;
+                            int len = size;
+
+                            // Always-ignore overlays
+                            if (ExeNameEqualsIgnoreCase(_procPathSb, len, "ScreenClippingHost.exe") ||
+                                ExeNameEqualsIgnoreCase(_procPathSb, len, "SnippingTool.exe"))
+                            {
+                                kind = ProcKind.AlwaysIgnore;
+                            }
+                            // Zoom share helpers (NOT just Zoom.exe)
+                            else if (ExeNameEqualsIgnoreCase(_procPathSb, len, "CptHost.exe") ||   // seen in some Zoom installs :contentReference[oaicite:1]{index=1}
+                                     ExeNameEqualsIgnoreCase(_procPathSb, len, "zShare.exe") ||
+                                     ExeNameEqualsIgnoreCase(_procPathSb, len, "Zoom.exe"))
+                            {
+                                kind = ProcKind.ZoomShare;
+                            }
+                            // Teams
+                            else if (ExeNameEqualsIgnoreCase(_procPathSb, len, "Teams.exe") ||
+                                     ExeNameEqualsIgnoreCase(_procPathSb, len, "ms-teams.exe"))
+                            {
+                                kind = ProcKind.TeamsShare;
+                            }
+                            // Chromium-family browsers (screen share bars etc)
+                            else if (ExeNameEqualsIgnoreCase(_procPathSb, len, "chrome.exe") ||
+                                     ExeNameEqualsIgnoreCase(_procPathSb, len, "msedge.exe") ||
+                                     ExeNameEqualsIgnoreCase(_procPathSb, len, "chromium.exe") ||
+                                     ExeNameEqualsIgnoreCase(_procPathSb, len, "brave.exe") ||
+                                     ExeNameEqualsIgnoreCase(_procPathSb, len, "opera.exe") ||
+                                     ExeNameEqualsIgnoreCase(_procPathSb, len, "msedgewebview2.exe"))
+                            {
+                                kind = ProcKind.ChromiumShare;
+                            }
+                            else
+                            {
+                                kind = ProcKind.Other;
+                            }
                         }
                     }
+                    finally
+                    {
+                        CloseHandle(hProc);
+                    }
                 }
-                finally
-                {
-                    CloseHandle(hProc);
-                }
+
+                _pidKind[pid] = kind;
             }
 
-            _pidIsIgnoredOccluder[pid] = ignored;
-            return ignored;
+            // Behaviour by kind:
+            if (kind == ProcKind.AlwaysIgnore)
+                return true;
+
+            if (kind == ProcKind.ZoomShare || kind == ProcKind.TeamsShare || kind == ProcKind.ChromiumShare)
+                return LooksLikeShareToolbar(wr, exStyle);
+
+            return false;
         }
+
 
 
         private unsafe void ClearBackBufferRect(
@@ -715,7 +762,16 @@ namespace ScreenColourReplacer
                 if (!GetWindowRect(h, out var wr)) continue;
                 if (!Intersect(wr, interest, out _)) continue; // prune first
 
-                if (IsIgnoredOccluderWindow(h)) continue;      // expensive last
+                long exStyle = GetWindowLongPtr(h, GWL_EXSTYLE).ToInt64();
+
+                // Cheap + safe: ignore click-through / fully transparent windows
+                if (IsTrulyNonOccludingByStyle(exStyle, h))
+                    continue;
+
+                // More expensive: process-based filtering for share overlays
+                if (IsIgnoredOccluderWindow(h, wr, exStyle))
+                    continue;
+
 
                 _zIndex[h] = _zOrder.Count;
                 _zOrder.Add((h, wr));
@@ -922,6 +978,41 @@ namespace ScreenColourReplacer
             x ^= s + 0x9E3779B97F4A7C15UL;
             x *= PRIME;
             return x;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool IsTrulyNonOccludingByStyle(long exStyle, IntPtr hwnd)
+        {
+            // Click-through windows cannot occlude anything.
+            if ((exStyle & WS_EX_TRANSPARENT) != 0)
+                return true;
+
+            // Fully transparent layered windows also shouldn't occlude.
+            if ((exStyle & WS_EX_LAYERED) != 0 &&
+                GetLayeredWindowAttributes(hwnd, out _, out byte alpha, out uint flags) &&
+                (flags & LWA_ALPHA) != 0 &&
+                alpha == 0)
+                return true;
+
+            return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool LooksLikeShareToolbar(in RECT r, long exStyle)
+        {
+            // Share toolbars are typically always-on-top and thin.
+            if ((exStyle & WS_EX_TOPMOST) == 0)
+                return false;
+
+            int w = r.Width, h = r.Height;
+            if (w <= 0 || h <= 0) return false;
+
+            // Most are toolwindows; keep this fairly strict to avoid ignoring real windows.
+            if ((exStyle & WS_EX_TOOLWINDOW) != 0)
+                return (h <= 220 && w >= 240);
+
+            // Fallback: some toolbars may not set TOOLWINDOW; only accept very thin strips.
+            return (h <= 120 && w >= 500);
         }
 
 
@@ -1421,6 +1512,18 @@ namespace ScreenColourReplacer
         private const int SM_CXVIRTUALSCREEN = 78;
         private const int SM_CYVIRTUALSCREEN = 79;
 
+        // --- extra exstyle bits ---
+        private const long WS_EX_TOPMOST = 0x00000008;
+
+        // --- layered window alpha query ---
+        private const uint LWA_COLORKEY = 0x00000001;
+        private const uint LWA_ALPHA = 0x00000002;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool GetLayeredWindowAttributes(
+            IntPtr hwnd, out uint pcrKey, out byte pbAlpha, out uint pdwFlags);
+
+
         private static bool Intersect(in RECT a, in RECT b, out RECT r)
         {
             int l = Math.Max(a.Left, b.Left);
@@ -1461,38 +1564,38 @@ namespace ScreenColourReplacer
             return res;
         }
 
-        private List<RECT> GetVisibleExcelRects(IntPtr excelHwnd, RECT excelRect)
-        {
-            // Start with the full Excel rect, subtract occluders above it.
-            var visible = new List<RECT> { excelRect };
+        //private List<RECT> GetVisibleExcelRects(IntPtr excelHwnd, RECT excelRect)
+        //{
+        //    // Start with the full Excel rect, subtract occluders above it.
+        //    var visible = new List<RECT> { excelRect };
 
-            for (IntPtr h = GetTopWindow(IntPtr.Zero); h != IntPtr.Zero && h != excelHwnd; h = GetWindow(h, GW_HWNDNEXT))
-            {
-                if (!IsWindowVisible(h) || IsIconic(h)) continue;
-                if (IsIgnoredOccluderWindow(h)) continue;
+        //    for (IntPtr h = GetTopWindow(IntPtr.Zero); h != IntPtr.Zero && h != excelHwnd; h = GetWindow(h, GW_HWNDNEXT))
+        //    {
+        //        if (!IsWindowVisible(h) || IsIconic(h)) continue;
+        //        if (IsIgnoredOccluderWindow(h)) continue;
 
-                // Skip our own overlay window if it ever appears in enumeration
-                if (h == new WindowInteropHelper(this).Handle) continue;
+        //        // Skip our own overlay window if it ever appears in enumeration
+        //        if (h == new WindowInteropHelper(this).Handle) continue;
 
-                // Optional: skip “empty” windows (tooltips etc.)
-                if (GetWindowTextLength(h) == 0) { /* you may want to keep these; leave as-is */ }
+        //        // Optional: skip “empty” windows (tooltips etc.)
+        //        if (GetWindowTextLength(h) == 0) { /* you may want to keep these; leave as-is */ }
 
-                if (!GetWindowRect(h, out var wr)) continue;
+        //        if (!GetWindowRect(h, out var wr)) continue;
 
-                // Only care if it overlaps Excel
-                if (!Intersect(wr, excelRect, out var overlap)) continue;
+        //        // Only care if it overlaps Excel
+        //        if (!Intersect(wr, excelRect, out var overlap)) continue;
 
-                // Subtract this overlap from all current visible rects
-                var next = new List<RECT>(visible.Count * 2);
-                foreach (var v in visible)
-                    next.AddRange(SubtractRect(v, overlap));
+        //        // Subtract this overlap from all current visible rects
+        //        var next = new List<RECT>(visible.Count * 2);
+        //        foreach (var v in visible)
+        //            next.AddRange(SubtractRect(v, overlap));
 
-                visible = next;
-                if (visible.Count == 0) break;
-            }
+        //        visible = next;
+        //        if (visible.Count == 0) break;
+        //    }
 
-            return visible;
-        }
+        //    return visible;
+        //}
 
     }
 }
