@@ -31,7 +31,7 @@ namespace ScreenColourReplacer
     public partial class MainWindow : Window
     {
         // ---------- Perf knobs ----------
-        private const int TIMER_MS = 30; // 20 FPS-ish. Try 33 for 30 FPS, 100 for 10 FPS.
+        private const int TIMER_MS = 33; // Try 33 for 30 FPS, 100 for 10 FPS.
         private const int LUT_BITS = 5;  // 5 => 32 levels/channel (32^3 = 32768)
         private const int LUT_SIZE = 1 << LUT_BITS;
         private const int LUT_MASK = LUT_SIZE - 1;
@@ -82,6 +82,18 @@ namespace ScreenColourReplacer
         private int _zOrderCountdown = 0;
         private IntPtr _lastForeground = IntPtr.Zero;
         private const int ZORDER_REFRESH_EVERY_N_TICKS = 3; // ~90ms at 30ms tick
+
+        // How often to re-scan the whole desktop for new Excel windows.
+        // 10 ticks @ 30ms = ~300ms
+        private const int EXCEL_ENUM_REFRESH_EVERY_N_TICKS = 10;
+
+        private int _excelEnumCountdown = 0;
+
+        // Known Excel top-level HWNDs (discovered by EnumWindows occasionally)
+        private readonly List<IntPtr> _excelHwnds = new(8);
+        private readonly List<IntPtr> _excelHwndsToRemove = new(8);
+        private readonly HashSet<IntPtr> _excelFound = new(16);
+
 
 
         private struct DrawJob
@@ -251,7 +263,9 @@ namespace ScreenColourReplacer
         {
             if (_overlay == null) return;
 
-            var wins = GetExcelWindows_Reused();
+            EnsureExcelHwndsUpToDate();
+            var wins = GetExcelWindows_FromKnownHwnds();
+
 
             // 1) Compute stale regions from previous snapshot -> current (no lock)
             CollectStaleRegions(_lastWins, wins, _staleRects);
@@ -1052,9 +1066,19 @@ namespace ScreenColourReplacer
         [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
         [DllImport("user32.dll")] private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
 
-        private List<ExcelWin> GetExcelWindows_Reused()
+        private void EnsureExcelHwndsUpToDate()
         {
-            _wins.Clear();
+            // If we currently have none, scan immediately (keeps startup responsive)
+            if (_excelHwnds.Count == 0 || _excelEnumCountdown-- <= 0)
+            {
+                EnumerateExcelHwnds();
+                _excelEnumCountdown = EXCEL_ENUM_REFRESH_EVERY_N_TICKS;
+            }
+        }
+
+        private void EnumerateExcelHwnds()
+        {
+            _excelFound.Clear();
 
             EnumWindows((hWnd, _) =>
             {
@@ -1063,27 +1087,75 @@ namespace ScreenColourReplacer
                 _classSb.Clear();
                 GetClassName(hWnd, _classSb, _classSb.Capacity);
 
-                // Compare without ToString()
                 if (!IsExcelClass(_classSb)) return true;
 
-                if (!GetClientRect(hWnd, out var rcClient)) return true;
-                if (rcClient.Width <= 0 || rcClient.Height <= 0) return true;
+                _excelFound.Add(hWnd);
+                return true;
+            }, IntPtr.Zero);
+
+            // Remove anything no longer present
+            _excelHwndsToRemove.Clear();
+            for (int i = 0; i < _excelHwnds.Count; i++)
+                if (!_excelFound.Contains(_excelHwnds[i]))
+                    _excelHwndsToRemove.Add(_excelHwnds[i]);
+
+            for (int i = 0; i < _excelHwndsToRemove.Count; i++)
+                _excelHwnds.Remove(_excelHwndsToRemove[i]);
+
+            // Add newly found
+            foreach (var h in _excelFound)
+                if (!_excelHwnds.Contains(h))
+                    _excelHwnds.Add(h);
+        }
+
+        private List<ExcelWin> GetExcelWindows_FromKnownHwnds()
+        {
+            _wins.Clear();
+            _excelHwndsToRemove.Clear();
+
+            for (int i = 0; i < _excelHwnds.Count; i++)
+            {
+                var hWnd = _excelHwnds[i];
+
+                // If hwnd got destroyed OR reused by a non-Excel window, drop it.
+                if (!IsWindow(hWnd) || !IsWindowVisible(hWnd) || IsIconic(hWnd))
+                {
+                    // Keep minimized/hidden Excel? If you prefer keeping them, change this:
+                    // - If IsWindow(hWnd) is true but it's minimized, DON'T remove, just continue.
+                    // I’d suggest keeping minimized ones:
+                    if (!IsWindow(hWnd)) _excelHwndsToRemove.Add(hWnd);
+                    continue;
+                }
+
+                _classSb.Clear();
+                GetClassName(hWnd, _classSb, _classSb.Capacity);
+                if (!IsExcelClass(_classSb))
+                {
+                    _excelHwndsToRemove.Add(hWnd);
+                    continue;
+                }
+
+                if (!GetClientRect(hWnd, out var rcClient)) continue;
+                if (rcClient.Width <= 0 || rcClient.Height <= 0) continue;
 
                 // Client origin (0,0) -> screen
                 var tl = new POINT { X = 0, Y = 0 };
                 ClientToScreen(hWnd, ref tl);
 
-                // BR = TL + client size (no second ClientToScreen)
-                int right = tl.X + rcClient.Right;   // rcClient.Right == width
-                int bottom = tl.Y + rcClient.Bottom; // rcClient.Bottom == height
+                int right = tl.X + rcClient.Right;   // width
+                int bottom = tl.Y + rcClient.Bottom; // height
 
                 _wins.Add(new ExcelWin(hWnd, new RECT { Left = tl.X, Top = tl.Y, Right = right, Bottom = bottom }));
-                return true;
+            }
 
-            }, IntPtr.Zero);
+            // Apply removals
+            for (int i = 0; i < _excelHwndsToRemove.Count; i++)
+                _excelHwnds.Remove(_excelHwndsToRemove[i]);
 
             return _wins;
         }
+
+
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static bool IsExcelClass(StringBuilder sb)
@@ -1334,6 +1406,8 @@ namespace ScreenColourReplacer
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hWnd);
 
 
         private const int SM_XVIRTUALSCREEN = 76;
