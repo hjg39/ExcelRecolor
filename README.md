@@ -4,9 +4,11 @@
 
 No Excel plugins, no workbook changes.  This doesn't interact with Excel but draws over it.
 
-> Thrown together with AI.
-> 
-> Pls don't judge the messiness of the code layout which would not pass my professional coding standards in a million years.
+## Download 📦
+1. Latest release:
+   - https://github.com/hjg39/ExcelRecolor/releases
+
+---
 
 ---
 
@@ -17,9 +19,11 @@ No Excel plugins, no workbook changes.  This doesn't interact with Excel but dra
 
 ---
 
-## Download 📦
-1. Latest release:
-   - https://github.com/hjg39/ExcelRecolor/releases
+## Disclaimer 🧪
+
+> Thrown together with AI.
+> 
+> Pls don't judge the messiness of the code layout which would not pass my professional coding standards in a million years.
 
 ---
 
