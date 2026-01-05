@@ -771,8 +771,8 @@ namespace ScreenColourReplacer
         }
 
         // ---------- Hue matching config (your targets) ----------
-        private const int DEFAULT_TARGET_HUE_DEG = 285;
-        private int _targetHueDeg = DEFAULT_TARGET_HUE_DEG;
+        private const float DEFAULT_TARGET_HUE_DEG = 289.39f;
+        private float _targetHueDeg = DEFAULT_TARGET_HUE_DEG;
 
         private static readonly string HueConfigPath =
             Path.Combine(AppContext.BaseDirectory, "ScreenColourReplacer.config");
