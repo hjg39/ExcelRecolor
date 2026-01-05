@@ -32,7 +32,7 @@ namespace ScreenColourReplacer
     public partial class MainWindow : Window
     {
         // ---------- Perf knobs ----------
-        private const int TIMER_MS = 20; // 20 FPS-ish. Try 33 for 30 FPS, 100 for 10 FPS.
+        private const int TIMER_MS = 16; // 20 FPS-ish. Try 33 for 30 FPS, 100 for 10 FPS.
         private const int LUT_BITS = 5;  // 5 => 32 levels/channel (32^3 = 32768)
         private const int LUT_SIZE = 1 << LUT_BITS;
         private const int LUT_MASK = LUT_SIZE - 1;
@@ -586,7 +586,7 @@ namespace ScreenColourReplacer
 
                 for (int x = 0; x < w; x++)
                 {
-                    uint src = s[x];
+                    uint src = s[x] | 0xFF000000u; // force opaque alpha
 
                     int bQ = q[(byte)(src)];
                     int gQ = q[(byte)(src >> 8)];
@@ -594,9 +594,10 @@ namespace ScreenColourReplacer
 
                     int idx = (rQ << (2 * LUT_BITS)) | (gQ << LUT_BITS) | bQ;
 
-                    // Keep original behaviour: non-match => transparent (0)
-                    d[x] = lut[idx];
+                    uint mapped = lut[idx];
+                    d[x] = (mapped != 0) ? mapped : src;  // <<<<<< key change
                 }
+
             }
         }
 
@@ -1177,21 +1178,15 @@ namespace ScreenColourReplacer
 
         private void RemoveOtherSizesForHwnd(IntPtr hwnd, int keepW, int keepH)
         {
-            List<CacheKey>? kill = null;
+            _toDeleteKeys.Clear();
 
             foreach (var kv in _cache)
-            {
                 if (kv.Key.Hwnd == hwnd && (kv.Key.W != keepW || kv.Key.H != keepH))
-                {
-                    kill ??= new List<CacheKey>();
-                    kill.Add(kv.Key);
-                }
-            }
+                    _toDeleteKeys.Add(kv.Key);
 
-            if (kill == null) return;
-
-            foreach (var k in kill)
+            for (int i = 0; i < _toDeleteKeys.Count; i++)
             {
+                var k = _toDeleteKeys[i];
                 _cache[k].Dispose();
                 _cache.Remove(k);
             }
