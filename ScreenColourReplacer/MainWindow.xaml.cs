@@ -417,15 +417,27 @@ namespace ScreenColourReplacer
                 // If probe is unchanged, we skip full capture/hash/draw entirely.
                 if (!visChanged)
                 {
-                    ulong probeSig = cc.CaptureProbeSigFromScreen(screenDc, w.Rect.Left, w.Rect.Top);
-                    bool probeChanged = !cc.HasLastProbeSig || probeSig != cc.LastProbeSig;
+                    // If we recently detected changes, skip the probe (it will almost certainly change anyway)
+                    if (cc.HotCountdown <= 0)
+                    {
+                        ulong probeSig = cc.CaptureProbeSigFromScreen(screenDc, w.Rect.Left, w.Rect.Top);
+                        bool probeChanged = !cc.HasLastProbeSig || probeSig != cc.LastProbeSig;
 
-                    cc.LastProbeSig = probeSig;
-                    cc.HasLastProbeSig = true;
+                        cc.LastProbeSig = probeSig;
+                        cc.HasLastProbeSig = true;
 
-                    if (!probeChanged)
-                        continue;
+                        if (!probeChanged)
+                            continue;
+
+                        // We saw a change: enter "hot" mode for a few ticks
+                        cc.HotCountdown = 4; // ~4 ticks. Tune 2..8.
+                    }
+                    else
+                    {
+                        cc.HotCountdown--;
+                    }
                 }
+
 
 
                 ulong sig;
@@ -1237,6 +1249,8 @@ namespace ScreenColourReplacer
         // ---------- High-performance capture cache (BitBlt -> DIB section) ----------
         private sealed class CaptureCache : IDisposable
         {
+            public int HotCountdown; // counts down while content is actively changing
+
             // --- Probe (tiny downscaled capture) ---
             public ulong LastProbeSig;
             public bool HasLastProbeSig;
