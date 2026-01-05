@@ -97,6 +97,17 @@ namespace ScreenColourReplacer
         private readonly List<IntPtr> _excelHwndsToRemove = new(8);
         private readonly HashSet<IntPtr> _excelFound = new(16);
 
+        // ---------- Fast per-byte quantization (reduces work in pixel loop) ----------
+        private static readonly byte[] _q = BuildQuantTable();
+
+        private static byte[] BuildQuantTable()
+        {
+            var t = new byte[256];
+            int shift = 8 - LUT_BITS; // e.g. 3 when LUT_BITS=5
+            for (int i = 0; i < 256; i++)
+                t[i] = (byte)(i >> shift); // top LUT_BITS bits
+            return t;
+        }
 
 
         private struct DrawJob
@@ -868,6 +879,7 @@ namespace ScreenColourReplacer
 
 
         // ---------- LUT application ----------
+        // ---------- LUT application ----------
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         private unsafe void ApplyLutToBackBuffer_WithSrcOffset(
             IntPtr srcBits, int srcStride,
@@ -879,7 +891,9 @@ namespace ScreenColourReplacer
             byte* srcBase = (byte*)srcBits.ToPointer();
             byte* dstBase = (byte*)dstBackBuffer.ToPointer();
 
-            const int shift = 8 - LUT_BITS;
+            // local alias helps JIT a bit
+            byte[] q = _q;
+            uint[] lut = _lut32;
 
             for (int y = 0; y < h; y++)
             {
@@ -890,14 +904,15 @@ namespace ScreenColourReplacer
                 {
                     uint src = s[x] | 0xFF000000u; // force opaque alpha
 
-                    // BGRA in memory: B 0..7, G 8..15, R 16..23
-                    int bQ = (int)((src >> shift) & LUT_MASK);
-                    int gQ = (int)((src >> (8 + shift)) & LUT_MASK);
-                    int rQ = (int)((src >> (16 + shift)) & LUT_MASK);
+                    // BGRA little-endian in memory:
+                    //   B = low byte, G = next, R = next
+                    int bQ = q[(byte)(src)];
+                    int gQ = q[(byte)(src >> 8)];
+                    int rQ = q[(byte)(src >> 16)];
 
                     int idx = (rQ << (2 * LUT_BITS)) | (gQ << LUT_BITS) | bQ;
 
-                    uint mapped = _lut32[idx];
+                    uint mapped = lut[idx];
                     d[x] = (mapped != 0) ? mapped : src;
                 }
             }
