@@ -12,7 +12,6 @@ It’s intentionally lightweight: no Excel plugins, no workbook changes — just
 - ✅ Recolors green-ish Excel UI elements in real time
 - ✅ Configurable target hue (0–359°)
 - ✅ No Office add-ins / macros / workbook modification
-- ✅ Overlay excludes itself from screen capture
 
 ---
 
