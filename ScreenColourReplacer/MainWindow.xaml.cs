@@ -43,7 +43,8 @@ namespace ScreenColourReplacer
         private WriteableBitmap? _overlay;
         private int _vsLeft, _vsTop, _vsW, _vsH;
 
-        private readonly DispatcherTimer _timer = new DispatcherTimer
+        private readonly DispatcherTimer _timer = new DispatcherTimer(DispatcherPriority.Background)
+
         {
             Interval = TimeSpan.FromMilliseconds(TIMER_MS)
         };
