@@ -10,7 +10,6 @@ No Excel plugins, no workbook changes.  This doesn't interact with Excel but dra
 
 ---
 
----
 
 ## Features ✨
 - ✅ Recolors green-ish Excel UI elements in real time
