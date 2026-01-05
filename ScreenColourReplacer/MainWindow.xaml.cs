@@ -100,6 +100,9 @@ namespace ScreenColourReplacer
         private readonly List<ExcelWin> _wins = new(4);
         private readonly StringBuilder _classSb = new(16);
 
+        // Reuse this to avoid per-occluder allocations
+        private readonly StringBuilder _procPathSb = new StringBuilder(1024);
+
         // --- Fast per-byte quantization ---
         private static readonly byte[] _q = BuildQuantTable();
 
@@ -192,6 +195,42 @@ namespace ScreenColourReplacer
             hasher.GetCurrentHash(out8);
             return BinaryPrimitives.ReadUInt64LittleEndian(out8);
         }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool CharEqIgnoreCaseAscii(char a, char b)
+        {
+            // exe names are ASCII; this avoids allocations/culture
+            if (a == b) return true;
+            if ((uint)(a - 'A') <= ('Z' - 'A')) a = (char)(a | 0x20);
+            if ((uint)(b - 'A') <= ('Z' - 'A')) b = (char)(b | 0x20);
+            return a == b;
+        }
+
+        private static bool ExeNameEqualsIgnoreCase(StringBuilder fullPath, int len, string exeName)
+        {
+            if (len <= 0) return false;
+            if (len > fullPath.Length) len = fullPath.Length;
+
+            int i = len - 1;
+            while (i >= 0)
+            {
+                char c = fullPath[i];
+                if (c == '\\' || c == '/')
+                    break;
+                i--;
+            }
+            int start = i + 1;
+            int exeLen = len - start;
+            if (exeLen != exeName.Length) return false;
+
+            for (int j = 0; j < exeLen; j++)
+            {
+                if (!CharEqIgnoreCaseAscii(fullPath[start + j], exeName[j]))
+                    return false;
+            }
+            return true;
+        }
+
 
 
 
@@ -486,15 +525,17 @@ namespace ScreenColourReplacer
             {
                 try
                 {
-                    var sb = new StringBuilder(1024);
-                    int size = sb.Capacity;
-                    if (QueryFullProcessImageName(hProc, 0, sb, ref size))
-                    {
-                        string exe = Path.GetFileName(sb.ToString());
+                    _procPathSb.Clear();
+                    _procPathSb.EnsureCapacity(1024);
+                    int size = _procPathSb.Capacity;
 
-                        // Snipping Tool / clipping overlay (most common)
-                        if (exe.Equals("ScreenClippingHost.exe", StringComparison.OrdinalIgnoreCase) ||
-                            exe.Equals("SnippingTool.exe", StringComparison.OrdinalIgnoreCase))
+                    if (QueryFullProcessImageName(hProc, 0, _procPathSb, ref size))
+                    {
+                        // size is chars written (excluding null)
+                        int len = size;
+
+                        if (ExeNameEqualsIgnoreCase(_procPathSb, len, "ScreenClippingHost.exe") ||
+                            ExeNameEqualsIgnoreCase(_procPathSb, len, "SnippingTool.exe"))
                         {
                             ignored = true;
                         }
