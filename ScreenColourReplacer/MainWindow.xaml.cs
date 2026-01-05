@@ -101,6 +101,7 @@ namespace ScreenColourReplacer
             public CaptureCache Cc;
             public RECT ExcelRect;         // screen rect of the Excel client
             public List<RECT> Visibles;    // screen-space rects (already clipped), owned by that CaptureCache
+            public bool VisChanged;
         }
 
         public MainWindow()
@@ -386,7 +387,7 @@ namespace ScreenColourReplacer
                     cc.LastVisSig = visSig;
                     cc.HasLastVisSig = true;
 
-                    _jobs.Add(new DrawJob { Cc = cc, ExcelRect = w.Rect, Visibles = visibles });
+                    _jobs.Add(new DrawJob { Cc = cc, ExcelRect = w.Rect, Visibles = visibles, VisChanged = visChanged });
                     continue;
                 }
 
@@ -422,7 +423,7 @@ namespace ScreenColourReplacer
                 cc.LastVisSig = visSig;
                 cc.HasLastVisSig = true;
 
-                _jobs.Add(new DrawJob { Cc = cc, ExcelRect = w.Rect, Visibles = visibles });
+                _jobs.Add(new DrawJob { Cc = cc, ExcelRect = w.Rect, Visibles = visibles, VisChanged = visChanged });
 
             }
 
@@ -459,17 +460,18 @@ namespace ScreenColourReplacer
                     var excelRect = job.ExcelRect;
                     var visibles = job.Visibles;
 
-                    // Clear what we drew last time for this hwnd
-                    for (int i = 0; i < cc.LastVisibleRects.Count; i++)
+                    if (job.VisChanged)
                     {
-                        var r = cc.LastVisibleRects[i];
-                        ClearBackBufferRect_ScreenSpace(dstBackBuffer, dstStride, r);
-                        UnionInto(ref dirty, ref hasDirty, r);
-                    }
+                        for (int i = 0; i < cc.LastVisibleRects.Count; i++)
+                        {
+                            var r = cc.LastVisibleRects[i];
+                            ClearBackBufferRect_ScreenSpace(dstBackBuffer, dstStride, r);
+                            UnionInto(ref dirty, ref hasDirty, r);
+                        }
 
-                    // Update stored visibility rects
-                    cc.LastVisibleRects.Clear();
-                    cc.LastVisibleRects.AddRange(visibles);
+                        cc.LastVisibleRects.Clear();
+                        cc.LastVisibleRects.AddRange(visibles);
+                    }
 
                     // Draw current visible rects
                     for (int i = 0; i < visibles.Count; i++)
