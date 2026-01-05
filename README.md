@@ -2,7 +2,7 @@
 
 **ExcelRecolor** is a tiny Windows app that draws a transparent overlay on top of Excel and **recolors “Excel green” pixels** to a hue you choose — **purple by default**.
 
-No Excel plugins, no workbook changes.  This is a windows app that doesn't interact with Excel but draws over it.
+No Excel plugins, no workbook changes.  This doesn't interact with Excel but draws over it.
 
 > Thrown together with AI.
 > 
