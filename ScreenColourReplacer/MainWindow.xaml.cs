@@ -1129,14 +1129,6 @@ namespace ScreenColourReplacer
                     continue;
                 }
 
-                _classSb.Clear();
-                GetClassName(hWnd, _classSb, _classSb.Capacity);
-                if (!IsExcelClass(_classSb))
-                {
-                    _excelHwndsToRemove.Add(hWnd);
-                    continue;
-                }
-
                 if (!GetClientRect(hWnd, out var rcClient)) continue;
                 if (rcClient.Width <= 0 || rcClient.Height <= 0) continue;
 
