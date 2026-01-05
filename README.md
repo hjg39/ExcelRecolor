@@ -29,3 +29,11 @@ No Excel plugins, no workbook changes.  This doesn't interact with Excel but dra
 ## The Look 👀
 
 <img width="1023" height="665" alt="Screenshot 2026-01-04 185218" src="https://github.com/user-attachments/assets/5381183c-0aa5-4fce-89b8-0a016f4fcf35" />
+
+---
+
+## Developer Setup 🧰
+
+This is a **WPF desktop app targeting .NET 8 (Windows)**, built in Microsoft Visual Studio.
+
+---
