@@ -6,7 +6,7 @@ No Excel plugins, no workbook changes.  This is a windows app that doesn't inter
 
 > Thrown together with AI.
 > 
-> Pls no judge the messiness of the layout which would not pass coding standards in a hundred years.
+> Pls don't judge the messiness of the code layout which would not pass my professional coding standards in a million years.
 
 ---
 
