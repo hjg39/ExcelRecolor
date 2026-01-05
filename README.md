@@ -15,10 +15,6 @@ It’s intentionally lightweight: no Excel plugins, no workbook changes — just
 
 ---
 
-## Usage
-1. Download the latest release:
+## Download
+1. Latest release:
    - https://github.com/hjg39/ExcelRecolor/releases
-
-2. Edit `ScreenColourReplacer.config` (next to the `.exe`) and set:
-   ```ini
-   HUE=[whatever hue on the colour wheel (0-359) you want]
