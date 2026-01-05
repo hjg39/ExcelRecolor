@@ -384,7 +384,19 @@ namespace ScreenColourReplacer
                     excelZi = _zOrder.Count;
 
                 // Visible rects from cached Z-order
-                var visiblesRaw = GetVisibleExcelRects_FromZ(w.Rect, excelZi, cc.TmpVisA, cc.TmpVisB);
+                List<RECT> visiblesRaw;
+                if (excelZi == 0)
+                {
+                    // topmost in interest => nothing can occlude it
+                    cc.TmpVisA.Clear();
+                    cc.TmpVisA.Add(w.Rect);
+                    visiblesRaw = cc.TmpVisA;
+                }
+                else
+                {
+                    visiblesRaw = GetVisibleExcelRects_FromZ(w.Rect, excelZi, cc.TmpVisA, cc.TmpVisB);
+                }
+
 
                 // Clip to virtual screen into reused list
                 var visibles = cc.TmpClipped;
@@ -1269,8 +1281,8 @@ namespace ScreenColourReplacer
             public ulong LastProbeSig;
             public bool HasLastProbeSig;
 
-            private const int PROBE_W = 128;
-            private const int PROBE_H = 128;
+            private const int PROBE_W = 64;
+            private const int PROBE_H = 64;
 
             private readonly IntPtr _probeDc;
             private readonly IntPtr _probeBmp;
