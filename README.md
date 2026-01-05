@@ -4,7 +4,8 @@
 
 No Excel plugins, no workbook changes.  This is a windows app that doesn't interact with Excel but draws over it.
 
-> Thrown together with AI quickly. Pls no judge the messiness of the layout which would not pass coding standards in a hundred years.
+> Thrown together with AI.
+> Pls no judge the messiness of the layout which would not pass coding standards in a hundred years.
 
 ---
 
