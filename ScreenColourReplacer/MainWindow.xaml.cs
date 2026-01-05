@@ -413,6 +413,21 @@ namespace ScreenColourReplacer
                 // Fully visible if the only visible rect == fullCap
                 bool fullyVisible = (visibles.Count == 1 && RectsEqual(visibles[0], fullCap));
 
+                // If visibility didn't change, do a tiny probe capture first.
+                // If probe is unchanged, we skip full capture/hash/draw entirely.
+                if (!visChanged)
+                {
+                    ulong probeSig = cc.CaptureProbeSigFromScreen(screenDc, w.Rect.Left, w.Rect.Top);
+                    bool probeChanged = !cc.HasLastProbeSig || probeSig != cc.LastProbeSig;
+
+                    cc.LastProbeSig = probeSig;
+                    cc.HasLastProbeSig = true;
+
+                    if (!probeChanged)
+                        continue;
+                }
+
+
                 ulong sig;
 
                 // Capture + hash (outside lock)
@@ -532,7 +547,6 @@ namespace ScreenColourReplacer
 
             CleanupCacheForClosedWindows(wins);
         }
-
 
 
         private static RECT UnionAll(IReadOnlyList<ExcelWin> wins)
@@ -1223,6 +1237,20 @@ namespace ScreenColourReplacer
         // ---------- High-performance capture cache (BitBlt -> DIB section) ----------
         private sealed class CaptureCache : IDisposable
         {
+            // --- Probe (tiny downscaled capture) ---
+            public ulong LastProbeSig;
+            public bool HasLastProbeSig;
+
+            private const int PROBE_W = 128;
+            private const int PROBE_H = 128;
+
+            private readonly IntPtr _probeDc;
+            private readonly IntPtr _probeBmp;
+            private readonly IntPtr _probeOldObj;
+            private readonly IntPtr _probeBitsPtr;
+            private readonly int _probeStride; // PROBE_W * 4
+
+
             public int Width { get; }
             public int Height { get; }
             public int SrcStride { get; } // w * 4
@@ -1268,6 +1296,29 @@ namespace ScreenColourReplacer
                 if (_hBmp == IntPtr.Zero) throw new Exception("CreateDIBSection failed.");
 
                 _oldObj = SelectObject(_memDc, _hBmp);
+
+                // Create probe DC/DIB (tiny) for fast "did anything change?" checks
+                _probeStride = PROBE_W * 4;
+                _probeDc = CreateCompatibleDC(IntPtr.Zero);
+
+                BITMAPINFO pbmi = new BITMAPINFO
+                {
+                    biSize = (uint)Marshal.SizeOf<BITMAPINFO>(),
+                    biWidth = PROBE_W,
+                    biHeight = -PROBE_H,
+                    biPlanes = 1,
+                    biBitCount = 32,
+                    biCompression = BI_RGB
+                };
+
+                _probeBmp = CreateDIBSection(_probeDc, ref pbmi, DIB_RGB_COLORS, out _probeBitsPtr, IntPtr.Zero, 0);
+                if (_probeBmp == IntPtr.Zero) throw new Exception("CreateDIBSection (probe) failed.");
+
+                _probeOldObj = SelectObject(_probeDc, _probeBmp);
+
+                // Speed-oriented stretch mode (set once)
+                SetStretchBltMode(_probeDc, COLORONCOLOR);
+
             }
 
             // in CaptureCache
@@ -1306,11 +1357,38 @@ namespace ScreenColourReplacer
                 CaptureScreenRegion(screenDc, screenX, screenY);
             }
 
+            public unsafe ulong CaptureProbeSigFromScreen(IntPtr screenDc, int screenX, int screenY)
+            {
+                // Downscale the *entire* Excel client rect into a tiny probe image.
+                // If anything visible changes, this almost always changes too.
+                StretchBlt(
+                    _probeDc,
+                    0, 0, PROBE_W, PROBE_H,
+                    screenDc,
+                    screenX, screenY, Width, Height,
+                    SRCCOPY);
+
+                var hasher = new XxHash3();
+                var all = new ReadOnlySpan<byte>(_probeBitsPtr.ToPointer(), PROBE_H * _probeStride);
+                hasher.Append(all);
+
+                Span<byte> out8 = stackalloc byte[8];
+                hasher.GetCurrentHash(out8);
+                return BinaryPrimitives.ReadUInt64LittleEndian(out8);
+            }
+
+
+
             public void Dispose()
             {
                 if (_oldObj != IntPtr.Zero) SelectObject(_memDc, _oldObj);
                 if (_hBmp != IntPtr.Zero) DeleteObject(_hBmp);
                 if (_memDc != IntPtr.Zero) DeleteDC(_memDc);
+
+                if (_probeOldObj != IntPtr.Zero) SelectObject(_probeDc, _probeOldObj);
+                if (_probeBmp != IntPtr.Zero) DeleteObject(_probeBmp);
+                if (_probeDc != IntPtr.Zero) DeleteDC(_probeDc);
+
             }
         }
 
@@ -1421,6 +1499,18 @@ namespace ScreenColourReplacer
         private static extern IntPtr GetForegroundWindow();
 
         [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hWnd);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern bool StretchBlt(
+            IntPtr hdcDest, int xDest, int yDest, int wDest, int hDest,
+            IntPtr hdcSrc, int xSrc, int ySrc, int wSrc, int hSrc,
+            int rop);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern int SetStretchBltMode(IntPtr hdc, int mode);
+
+        private const int COLORONCOLOR = 3;
+
 
 
         private const int SM_XVIRTUALSCREEN = 76;
